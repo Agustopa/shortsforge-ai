@@ -1,0 +1,6 @@
+{
+  "name": "ShortsForge AI",
+  "description": "Turn one idea into a complete short video.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
