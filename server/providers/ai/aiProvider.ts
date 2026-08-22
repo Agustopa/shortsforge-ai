@@ -133,39 +133,46 @@ export class GoogleAIProvider implements AIProvider {
     }
 
     const modelsToTry = [
-      'gemini-2.5-flash',
-      'gemini-2.5-flash-lite',
       'gemini-3.7-flash',
-      'gemini-3.1-flash-lite',
-      'gemini-flash-latest'
+      'gemini-flash-latest',
+      'gemini-3.1-flash-lite'
     ];
 
     let lastError: any = null;
 
     for (const model of modelsToTry) {
-      try {
-        const response = await this.ai.models.generateContent({
-          model,
-          contents: params.contents,
-          config: params.config
-        });
-        return response;
-      } catch (err: any) {
-        lastError = err;
-        const errMessage = err?.message || String(err);
-        const isQuota = err?.status === 'RESOURCE_EXHAUSTED' || 
-                        errMessage.includes('429') || 
-                        errMessage.includes('Quota exceeded') ||
-                        errMessage.includes('RESOURCE_EXHAUSTED');
-        
-        if (isQuota) {
-          console.warn(`[AIProvider] Quota reached on ${model}, trying next available model in cascade...`);
-          // Brief pause before trying next model
-          await new Promise(r => setTimeout(r, 400));
-          continue;
-        } else {
-          console.warn(`[AIProvider] Request failed on ${model}: ${errMessage.substring(0, 120)}`);
-          continue;
+      // Retry up to 2 times for transient errors (503 high demand, 429 rate limit, 500, network)
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const response = await this.ai.models.generateContent({
+            model,
+            contents: params.contents,
+            config: params.config
+          });
+          return response;
+        } catch (err: any) {
+          lastError = err;
+          const errMessage = err?.message || String(err);
+          const isHighDemand = errMessage.includes('503') ||
+                               errMessage.includes('high demand') ||
+                               errMessage.includes('overloaded') ||
+                               errMessage.includes('UNAVAILABLE') ||
+                               errMessage.includes('Service Unavailable');
+          const isQuota = err?.status === 'RESOURCE_EXHAUSTED' || 
+                          errMessage.includes('429') || 
+                          errMessage.includes('Quota exceeded') ||
+                          errMessage.includes('RESOURCE_EXHAUSTED');
+
+          if (isHighDemand || isQuota) {
+            console.warn(`[AIProvider] ${model} attempt ${attempt} encountered ${isHighDemand ? '503 High Demand' : '429 Rate Limit'}. Backing off...`);
+            if (attempt < 2) {
+              await new Promise(r => setTimeout(r, 600 * attempt));
+              continue;
+            }
+          } else {
+            console.warn(`[AIProvider] Request failed on ${model} (attempt ${attempt}): ${errMessage.substring(0, 120)}`);
+            break; // Move to next model cascade immediately
+          }
         }
       }
     }
@@ -532,7 +539,8 @@ Requirements for hooks:
     context?: Partial<GenerationContext>
   ): Promise<ScriptResult> {
     const topic = this.validateTopicInput(analysis.topic);
-    const targetWordCount = Math.round(targetDuration * (analysis.language === 'id' ? 2.9 : 2.6));
+    const numTargetDuration = typeof targetDuration === 'number' ? targetDuration : 30;
+    const targetWordCount = Math.round(numTargetDuration * (analysis.language === 'id' ? 2.9 : 2.6));
     const minWords = Math.round(targetWordCount * 0.85);
     const maxWords = Math.round(targetWordCount * 1.15);
 
@@ -643,7 +651,7 @@ CRITICAL DIRECTIVES:
     context?: Partial<GenerationContext>
   ): Promise<{ scenes: Scene[]; visualBible: VisualBible }> {
     const topic = this.validateTopicInput(analysis.topic);
-    const totalDuration = analysis.duration || 30;
+    const totalDuration = typeof analysis.duration === 'number' ? analysis.duration : 30;
     const targetSceneCount = totalDuration <= 15 ? 4 : totalDuration <= 30 ? 6 : totalDuration <= 60 ? 9 : 12;
 
     if (!this.ai) {
@@ -782,7 +790,8 @@ Visual Bible:
     visualMode: VisualMode
   ): { scenes: Scene[]; visualBible: VisualBible } {
     const topic = analysis.topic;
-    const durPerScene = Number((analysis.duration / sceneCount).toFixed(2));
+    const totalDur = typeof analysis.duration === 'number' ? analysis.duration : 30;
+    const durPerScene = Number((totalDur / sceneCount).toFixed(2));
 
     const visualBible: VisualBible = {
       locations: [`Atmospheric setting for ${topic}`, `Detailed perspective of ${topic}`],

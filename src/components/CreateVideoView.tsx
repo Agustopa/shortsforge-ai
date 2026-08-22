@@ -83,11 +83,11 @@ export const CreateVideoView: React.FC<CreateVideoViewProps> = ({
   ];
 
   const durations: { value: VideoDuration; label: string }[] = [
-    { value: 15, label: '15s' },
-    { value: 30, label: '30s' },
-    { value: 45, label: '45s' },
-    { value: 60, label: '60s' },
-    { value: 90, label: '90s' }
+    { value: 30, label: 'Auto (Min 30s)' },
+    { value: 45, label: '45s Extended' },
+    { value: 60, label: '60s Deep Dive' },
+    { value: 90, label: '90s Full Story' },
+    { value: 15, label: '15s Quick Hook' }
   ];
 
   const styles: ContentStyle[] = [

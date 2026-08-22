@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { Project, GenerationJob, MediaAsset, ContentIdea, ProviderStatus } from '../../src/types/index';
+import { Project, GenerationJob, MediaAsset, ContentIdea, ProviderStatus, AutoEditorProject } from '../../src/types/index';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
@@ -9,6 +9,7 @@ const UPLOADS_DIR = path.join(process.cwd(), 'public', 'uploads');
 
 export interface DatabaseSchema {
   projects: Record<string, Project>;
+  autoEditorProjects?: Record<string, AutoEditorProject>;
   jobs: Record<string, GenerationJob>;
   mediaAssets: Record<string, MediaAsset>;
   contentIdeas: ContentIdea[];
@@ -28,6 +29,7 @@ export interface DatabaseSchema {
 
 const DEFAULT_DB: DatabaseSchema = {
   projects: {},
+  autoEditorProjects: {},
   jobs: {},
   mediaAssets: {},
   contentIdeas: [],
@@ -133,6 +135,52 @@ class Database {
   public deleteProject(id: string): boolean {
     if (this.data.projects[id]) {
       delete this.data.projects[id];
+      this.save();
+      return true;
+    }
+    return false;
+  }
+
+  // AutoEditor Projects
+  public getAutoEditorProjects(): AutoEditorProject[] {
+    if (!this.data.autoEditorProjects) this.data.autoEditorProjects = {};
+    return Object.values(this.data.autoEditorProjects).sort((a, b) =>
+      new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+  }
+
+  public getAutoEditorProject(id: string): AutoEditorProject | null {
+    if (!this.data.autoEditorProjects) this.data.autoEditorProjects = {};
+    return this.data.autoEditorProjects[id] || null;
+  }
+
+  public setAutoEditorProject(project: AutoEditorProject): AutoEditorProject {
+    if (!this.data.autoEditorProjects) this.data.autoEditorProjects = {};
+    this.data.autoEditorProjects[project.id] = {
+      ...project,
+      updatedAt: new Date().toISOString()
+    };
+    this.save();
+    return this.data.autoEditorProjects[project.id];
+  }
+
+  public updateAutoEditorProject(id: string, updates: Partial<AutoEditorProject>): AutoEditorProject | null {
+    if (!this.data.autoEditorProjects) this.data.autoEditorProjects = {};
+    const existing = this.data.autoEditorProjects[id];
+    if (!existing) return null;
+    this.data.autoEditorProjects[id] = {
+      ...existing,
+      ...updates,
+      updatedAt: new Date().toISOString()
+    };
+    this.save();
+    return this.data.autoEditorProjects[id];
+  }
+
+  public deleteAutoEditorProject(id: string): boolean {
+    if (!this.data.autoEditorProjects) this.data.autoEditorProjects = {};
+    if (this.data.autoEditorProjects[id]) {
+      delete this.data.autoEditorProjects[id];
       this.save();
       return true;
     }

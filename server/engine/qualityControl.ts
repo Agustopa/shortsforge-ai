@@ -42,7 +42,7 @@ export class QualityControlEngine {
     }
 
     // Check 3: Duration & Pacing Check
-    const targetDur = updated.duration || 30;
+    const targetDur = typeof updated.duration === 'number' ? updated.duration : 30;
     const currentSceneDur = updated.scenes.reduce((acc, s) => acc + (s.duration || 0), 0);
     const diff = Math.abs(currentSceneDur - targetDur);
 

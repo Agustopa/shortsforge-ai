@@ -8,10 +8,11 @@ import {
   Image as ImageIcon,
   Settings,
   Sparkles,
-  Zap
+  Zap,
+  Wand2
 } from 'lucide-react';
 
-export type NavTab = 'dashboard' | 'create' | 'batch' | 'ideas' | 'projects' | 'media' | 'settings';
+export type NavTab = 'dashboard' | 'create' | 'autoedit' | 'batch' | 'ideas' | 'projects' | 'media' | 'settings';
 
 interface SidebarProps {
   currentTab: NavTab;
@@ -22,7 +23,8 @@ interface SidebarProps {
 export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab, onQuickCreate }) => {
   const navItems = [
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
-    { id: 'create', label: 'Create Video', icon: Clapperboard, highlight: true },
+    { id: 'create', label: 'Create Video', icon: Clapperboard },
+    { id: 'autoedit', label: 'AI Auto Editor', icon: Wand2, highlight: true },
     { id: 'batch', label: 'Batch Generator', icon: Layers },
     { id: 'ideas', label: 'Content Ideas', icon: Lightbulb },
     { id: 'projects', label: 'Projects', icon: FolderKanban },

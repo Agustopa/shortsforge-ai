@@ -6,3 +6,10 @@ coverage/
 *.log
 .env*
 !.env.example
+
+data/db.json
+data/temp/
+data/temp_auto_editor/
+public/generated/
+public/uploads/
+public/audio/music/*.mp3

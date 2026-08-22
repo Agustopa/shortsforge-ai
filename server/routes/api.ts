@@ -9,6 +9,7 @@ import { ttsProvider } from '../providers/tts/ttsProvider';
 import { visualProvider } from '../providers/visual/visualProvider';
 import { musicProvider } from '../providers/music/musicProvider';
 import { videoEngine } from '../engine/videoEngine';
+import { autoEditorEngine } from '../engine/autoEditorEngine';
 import {
   Project,
   LanguageCode,
@@ -23,7 +24,10 @@ import {
   QualityMode,
   VisualMode,
   ProviderStatus,
-  MediaAsset
+  MediaAsset,
+  AutoEditorProject,
+  AutoEditorStyle,
+  UploadedMediaItem
 } from '../../src/types/index';
 
 const router = Router();
@@ -42,7 +46,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
   storage,
-  limits: { fileSize: 100 * 1024 * 1024 } // 100MB max
+  limits: { fileSize: 500 * 1024 * 1024 } // 500MB max
 });
 
 // GET /api/v1/providers/status
@@ -57,6 +61,24 @@ router.get('/providers/status', (req: Request, res: Response) => {
       statusText: geminiConfigured ? 'Connected & Active' : 'Fallback Engine (Mock/Heuristic)',
       description: 'Drives topic analysis, search grounding, hook scoring, scriptwriting and scene planning.',
       isMock: !geminiConfigured
+    },
+    {
+      name: 'AI Internet Research Engine',
+      type: 'SEARCH',
+      isConfigured: true,
+      isAvailable: true,
+      statusText: 'Multi-Source Knowledge & Wiki Grounding Active',
+      description: 'Performs live internet research, Wikipedia querying, fact verification, and citation logging with strict topic isolation.',
+      isMock: false
+    },
+    {
+      name: 'Dynamic Visual Sourcing Engine',
+      type: 'STOCK',
+      isConfigured: true,
+      isAvailable: true,
+      statusText: 'Open Stock & Semantic Synthesizer Active',
+      description: 'Sources scene-specific visuals from Pexels, Unsplash, Wikimedia Commons, and AI image generation with zero asset repetition.',
+      isMock: false
     },
     {
       name: 'Google Gemini TTS & Synthesis',
@@ -232,7 +254,7 @@ router.delete('/projects/:id', (req: Request, res: Response) => {
 });
 
 // POST /api/v1/projects/:id/variations (Generates 3 stylistic versions or 3 hooks)
-router.post('/api/v1/projects/:id/variations', async (req: Request, res: Response) => {
+router.post('/projects/:id/variations', async (req: Request, res: Response) => {
   const project = db.getProject(req.params.id);
   if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
 
@@ -295,7 +317,9 @@ router.post('/projects/:id/scenes/:sceneId/regenerate-visual', async (req: Reque
       scene,
       project.id,
       mode,
-      project.aspectRatio
+      project.aspectRatio,
+      project.topic,
+      project.jobId || 'manual_regen'
     );
 
     scene.visual_url = visualRes.url;
@@ -356,14 +380,14 @@ router.post('/projects/:id/scenes/:sceneId/regenerate-voice', async (req: Reques
   }
 });
 
-// POST /api/v1/projects/:id/rerender (Fast selective re-render)
-router.post('/projects/:id/rerender', async (req: Request, res: Response) => {
+// POST /api/v1/projects/:id/rerender & /api/v1/projects/:id/render
+const handleRenderProject = async (req: Request, res: Response) => {
   const project = db.getProject(req.params.id);
   if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
 
   try {
     project.status = 'RENDERING';
-    project.currentStage = 'Re-rendering updated video timeline';
+    project.currentStage = 'Rendering updated video timeline';
     db.setProject(project);
 
     const renderRes = await videoEngine.renderVideo(project, {
@@ -377,7 +401,7 @@ router.post('/projects/:id/rerender', async (req: Request, res: Response) => {
     project.thumbnailUrl = renderRes.thumbnailUrl;
     project.status = 'COMPLETED';
     project.progress = 100;
-    project.currentStage = 'Re-render completed';
+    project.currentStage = 'Render completed';
     db.setProject(project);
 
     res.json({ success: true, project });
@@ -387,7 +411,10 @@ router.post('/projects/:id/rerender', async (req: Request, res: Response) => {
     db.setProject(project);
     res.status(500).json({ success: false, error: err.message });
   }
-});
+};
+
+router.post('/projects/:id/rerender', handleRenderProject);
+router.post('/projects/:id/render', handleRenderProject);
 
 // GET /api/v1/jobs/:id
 router.get('/jobs/:id', (req: Request, res: Response) => {
@@ -505,6 +532,368 @@ router.get('/settings', (req: Request, res: Response) => {
 router.post('/settings', (req: Request, res: Response) => {
   const updated = db.updateSettings(req.body);
   res.json({ success: true, settings: updated });
+});
+
+// ============================================================
+// AI AUTO EDITOR ENDPOINTS
+// ============================================================
+
+// POST /api/v1/auto-editor/upload-chunk - Chunked upload for large raw media files (bypasses 413 limits)
+router.post('/auto-editor/upload-chunk', upload.single('chunk'), async (req: Request, res: Response) => {
+  try {
+    const file = req.file;
+    const { uploadId, chunkIndex, totalChunks, fileName } = req.body;
+
+    if (!file || !uploadId || chunkIndex === undefined || !totalChunks || !fileName) {
+      return res.status(400).json({ success: false, error: 'Missing chunk upload parameters.' });
+    }
+
+    const currentIdx = parseInt(chunkIndex, 10);
+    const total = parseInt(totalChunks, 10);
+    const tempFilePath = path.join(uploadsDir, `tmp_${uploadId}.part`);
+
+    // Append chunk to temp file
+    const chunkBuffer = fs.readFileSync(file.path);
+    fs.appendFileSync(tempFilePath, chunkBuffer);
+    try { fs.unlinkSync(file.path); } catch {}
+
+    // Check if this was the last chunk
+    if (currentIdx >= total - 1) {
+      const ext = path.extname(fileName) || '.mp4';
+      const cleanName = path.basename(fileName, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const finalFileName = `${cleanName}_${Date.now()}${ext}`;
+      const finalFilePath = path.join(uploadsDir, finalFileName);
+
+      fs.renameSync(tempFilePath, finalFilePath);
+
+      const isVideo = fileName.match(/\.(mp4|mov|webm|m4v|mkv)$/i) !== null;
+      let probe = { duration: 10, width: 1080, height: 1920, aspectRatio: '9:16', hasAudio: false };
+      try {
+        probe = await autoEditorEngine.probeMediaFile(finalFilePath);
+      } catch (err) {
+        console.warn('[AutoEditor Chunk] Probe note:', err);
+      }
+
+      const stats = fs.statSync(finalFilePath);
+      const mediaItem: UploadedMediaItem = {
+        id: `media_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+        originalName: fileName,
+        filePath: finalFilePath,
+        url: `/uploads/${finalFileName}`,
+        type: isVideo ? 'video' : 'image',
+        sizeBytes: stats.size,
+        duration: probe.duration,
+        width: probe.width,
+        height: probe.height,
+        aspectRatio: probe.aspectRatio,
+        hasAudio: probe.hasAudio
+      };
+
+      return res.json({
+        success: true,
+        isComplete: true,
+        mediaItem
+      });
+    }
+
+    return res.json({
+      success: true,
+      isComplete: false,
+      chunkIndex: currentIdx,
+      totalChunks: total
+    });
+  } catch (err: any) {
+    console.error('[API AutoEditor] Chunk upload error:', err);
+    res.status(500).json({ success: false, error: err?.message || 'Error processing upload chunk' });
+  }
+});
+
+// POST /api/v1/auto-editor/create-project - Initialize project from uploaded media items
+router.post('/auto-editor/create-project', (req: Request, res: Response) => {
+  try {
+    const { mediaItems, style = 'Viral Shorts', duration = 'AUTO', autoCta = true, title } = req.body;
+
+    if (!mediaItems || !Array.isArray(mediaItems) || mediaItems.length === 0) {
+      return res.status(400).json({ success: false, error: 'No media items provided.' });
+    }
+
+    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const randNum = Math.floor(Math.random() * 900 + 100);
+    const jobId = `autoedit_${dateStr}_${randNum}`;
+    const projectId = `ae_proj_${Date.now()}`;
+
+    const isVideo = mediaItems.some((m: UploadedMediaItem) => m.type === 'video');
+    const mediaType: 'video' | 'images' = isVideo ? 'video' : 'images';
+
+    const project: AutoEditorProject = {
+      id: projectId,
+      jobId,
+      title: title || mediaItems[0].originalName.replace(/\.[^/.]+$/, ''),
+      style: (style as AutoEditorStyle) || 'Viral Shorts',
+      targetDuration: duration || 'AUTO',
+      autoCta: autoCta !== false && autoCta !== 'false',
+      status: 'DRAFT',
+      progress: 0,
+      stageName: 'Media Uploaded',
+      statusMessage: 'Ready for AI Auto Editing',
+      mediaType,
+      uploadedMedia: mediaItems,
+      cuts: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    db.setAutoEditorProject(project);
+
+    res.status(201).json({
+      success: true,
+      jobId,
+      projectId,
+      project
+    });
+  } catch (err: any) {
+    console.error('[API AutoEditor] Create project error:', err);
+    res.status(500).json({ success: false, error: err?.message || 'Error creating Auto Editor project' });
+  }
+});
+
+// POST /api/v1/auto-editor/upload - Upload raw video or images (direct)
+router.post('/auto-editor/upload', upload.array('files', 20), async (req: Request, res: Response) => {
+  try {
+    const files = req.files as Express.Multer.File[];
+    if (!files || files.length === 0) {
+      return res.status(400).json({ success: false, error: 'No files uploaded. Please select at least one video or image.' });
+    }
+
+    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const randNum = Math.floor(Math.random() * 900 + 100);
+    const jobId = `autoedit_${dateStr}_${randNum}`;
+    const projectId = `ae_proj_${Date.now()}`;
+
+    const isVideo = files.some(f => f.mimetype.startsWith('video') || f.originalname.match(/\.(mp4|mov|webm|m4v)$/i));
+    const mediaType: 'video' | 'images' = isVideo ? 'video' : 'images';
+
+    const uploadedMediaItems: UploadedMediaItem[] = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      try {
+        const probe = await autoEditorEngine.probeMediaFile(file.path);
+        uploadedMediaItems.push({
+          id: `media_${i + 1}`,
+          originalName: file.originalname,
+          filePath: file.path,
+          url: `/uploads/${file.filename}`,
+          type: file.mimetype.startsWith('video') || file.originalname.match(/\.(mp4|mov|webm|m4v)$/i) ? 'video' : 'image',
+          sizeBytes: file.size,
+          duration: probe.duration,
+          width: probe.width,
+          height: probe.height,
+          aspectRatio: probe.aspectRatio,
+          hasAudio: probe.hasAudio
+        });
+      } catch (err) {
+        console.warn(`[AutoEditor] Probing error on ${file.originalname}:`, err);
+        uploadedMediaItems.push({
+          id: `media_${i + 1}`,
+          originalName: file.originalname,
+          filePath: file.path,
+          url: `/uploads/${file.filename}`,
+          type: file.mimetype.startsWith('video') || file.originalname.match(/\.(mp4|mov|webm|m4v)$/i) ? 'video' : 'image',
+          sizeBytes: file.size,
+          duration: 10,
+          width: 1080,
+          height: 1920,
+          aspectRatio: '9:16',
+          hasAudio: false
+        });
+      }
+    }
+
+    const project: AutoEditorProject = {
+      id: projectId,
+      jobId,
+      title: uploadedMediaItems[0].originalName.replace(/\.[^/.]+$/, ''),
+      style: (req.body.style as AutoEditorStyle) || 'Professional',
+      targetDuration: req.body.duration || 'AUTO',
+      autoCta: req.body.autoCta !== 'false',
+      status: 'DRAFT',
+      progress: 0,
+      stageName: 'Media Uploaded',
+      statusMessage: 'Ready for AI Auto Editing',
+      mediaType,
+      uploadedMedia: uploadedMediaItems,
+      cuts: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    db.setAutoEditorProject(project);
+
+    res.status(201).json({
+      success: true,
+      jobId,
+      projectId,
+      project
+    });
+  } catch (err: any) {
+    console.error('[API AutoEditor] Upload handling error:', err);
+    res.status(500).json({
+      success: false,
+      error: err?.message || 'Error processing uploaded media files'
+    });
+  }
+});
+
+// POST /api/v1/auto-editor/create-sample - Create project from pre-bundled sample footage
+router.post('/auto-editor/create-sample', async (req: Request, res: Response) => {
+  try {
+    const { sampleTopic = 'Deep Ocean Mysteries', style = 'Viral Shorts' } = req.body;
+    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const randNum = Math.floor(Math.random() * 900 + 100);
+    const jobId = `autoedit_${dateStr}_${randNum}`;
+    const projectId = `ae_sample_${Date.now()}`;
+
+    // Sample video placeholders from reliable royalty free CDN
+    const sampleItems: UploadedMediaItem[] = [
+      {
+        id: 'media_sample_1',
+        originalName: `${sampleTopic.replace(/\s+/g, '_')}_Part1.mp4`,
+        filePath: path.join(uploadsDir, 'sample_clip_1.mp4'),
+        url: 'https://assets.mixkit.co/videos/preview/mixkit-waves-in-the-water-1164-large.mp4',
+        type: 'video',
+        sizeBytes: 8500000,
+        duration: 15,
+        width: 1080,
+        height: 1920,
+        aspectRatio: '9:16',
+        hasAudio: true
+      },
+      {
+        id: 'media_sample_2',
+        originalName: `${sampleTopic.replace(/\s+/g, '_')}_Part2.mp4`,
+        filePath: path.join(uploadsDir, 'sample_clip_2.mp4'),
+        url: 'https://assets.mixkit.co/videos/preview/mixkit-set-of-plateaus-seen-from-the-sky-in-a-sunset-26070-large.mp4',
+        type: 'video',
+        sizeBytes: 9200000,
+        duration: 18,
+        width: 1080,
+        height: 1920,
+        aspectRatio: '9:16',
+        hasAudio: true
+      }
+    ];
+
+    const project: AutoEditorProject = {
+      id: projectId,
+      jobId,
+      title: `${sampleTopic} (AI Sample Clip)`,
+      style: (style as AutoEditorStyle) || 'Viral Shorts',
+      targetDuration: 'AUTO',
+      autoCta: true,
+      status: 'DRAFT',
+      progress: 0,
+      stageName: 'Media Uploaded',
+      statusMessage: 'Ready for AI Auto Editing',
+      mediaType: 'video',
+      uploadedMedia: sampleItems,
+      cuts: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    db.setAutoEditorProject(project);
+
+    res.status(201).json({
+      success: true,
+      jobId,
+      projectId,
+      project
+    });
+  } catch (err: any) {
+    console.error('[API AutoEditor] Sample project creation error:', err);
+    res.status(500).json({ success: false, error: err?.message || 'Failed to create sample project' });
+  }
+});
+
+// POST /api/v1/auto-editor/process - Trigger full AI Auto Edit pipeline
+router.post('/auto-editor/process', async (req: Request, res: Response) => {
+  const { projectId, jobId, style = 'Professional', duration = 'AUTO', autoCta = true, musicCategory, subtitlePreset } = req.body;
+
+  let project = db.getAutoEditorProject(projectId);
+  if (!project) {
+    return res.status(404).json({ success: false, error: 'Auto Editor project not found.' });
+  }
+
+  if (project.uploadedMedia.length === 0) {
+    return res.status(400).json({ success: false, error: 'No media uploaded in this project.' });
+  }
+
+  // Respond immediately with queued status, then process asynchronously
+  project.status = 'ANALYZING';
+  project.progress = 5;
+  project.stageName = 'Starting AI Auto Edit';
+  project.style = style;
+  project.targetDuration = duration;
+  project.autoCta = autoCta;
+  db.setAutoEditorProject(project);
+
+  res.json({ success: true, message: 'AI Auto Edit process initiated.', project });
+
+  // Async Execution
+  try {
+    await autoEditorEngine.executeAutoEditJob({
+      projectId: project.id,
+      jobId: project.jobId || jobId,
+      mediaType: project.mediaType,
+      uploadedFiles: project.uploadedMedia.map(m => ({
+        originalName: m.originalName,
+        filePath: m.filePath,
+        url: m.url,
+        sizeBytes: m.sizeBytes
+      })),
+      style,
+      targetDuration: duration,
+      autoCta,
+      musicCategory,
+      subtitlePreset
+    });
+  } catch (e: any) {
+    console.error('[API AutoEditor] Execution error:', e);
+  }
+});
+
+// GET /api/v1/auto-editor/projects - List all Auto Editor projects
+router.get('/auto-editor/projects', (req: Request, res: Response) => {
+  const projects = db.getAutoEditorProjects();
+  res.json({ success: true, projects });
+});
+
+// GET /api/v1/auto-editor/projects/:id - Get specific Auto Editor project
+router.get('/auto-editor/projects/:id', (req: Request, res: Response) => {
+  const project = db.getAutoEditorProject(req.params.id);
+  if (!project) {
+    return res.status(404).json({ success: false, error: 'Project not found.' });
+  }
+  res.json({ success: true, project });
+});
+
+// PUT /api/v1/auto-editor/projects/:id - Update Auto Editor project
+router.put('/auto-editor/projects/:id', (req: Request, res: Response) => {
+  const updated = db.updateAutoEditorProject(req.params.id, req.body);
+  if (!updated) {
+    return res.status(404).json({ success: false, error: 'Project not found.' });
+  }
+  res.json({ success: true, project: updated });
+});
+
+// DELETE /api/v1/auto-editor/projects/:id - Delete Auto Editor project
+router.delete('/auto-editor/projects/:id', (req: Request, res: Response) => {
+  const deleted = db.deleteAutoEditorProject(req.params.id);
+  if (!deleted) {
+    return res.status(404).json({ success: false, error: 'Project not found.' });
+  }
+  res.json({ success: true, message: 'Auto Editor project deleted.' });
 });
 
 export default router;

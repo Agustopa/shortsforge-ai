@@ -1,1 +1,53 @@
 @import "tailwindcss";
+
+@keyframes kenburns-zoomin {
+  0% {
+    transform: scale(1.0);
+  }
+  100% {
+    transform: scale(1.15);
+  }
+}
+
+@keyframes kenburns-zoomout {
+  0% {
+    transform: scale(1.18);
+  }
+  100% {
+    transform: scale(1.02);
+  }
+}
+
+@keyframes kenburns-panleft {
+  0% {
+    transform: scale(1.12) translateX(4%);
+  }
+  100% {
+    transform: scale(1.12) translateX(-4%);
+  }
+}
+
+@keyframes kenburns-panright {
+  0% {
+    transform: scale(1.12) translateX(-4%);
+  }
+  100% {
+    transform: scale(1.12) translateX(4%);
+  }
+}
+
+.animate-kenburns-zoomin {
+  animation: kenburns-zoomin 8s cubic-bezier(0.25, 1, 0.5, 1) infinite alternate;
+}
+
+.animate-kenburns-zoomout {
+  animation: kenburns-zoomout 8s cubic-bezier(0.25, 1, 0.5, 1) infinite alternate;
+}
+
+.animate-kenburns-panleft {
+  animation: kenburns-panleft 8s ease-in-out infinite alternate;
+}
+
+.animate-kenburns-panright {
+  animation: kenburns-panright 8s ease-in-out infinite alternate;
+}

@@ -3,6 +3,7 @@ import { Sidebar, NavTab } from './components/Sidebar';
 import { Header } from './components/Header';
 import { DashboardView } from './components/DashboardView';
 import { CreateVideoView } from './components/CreateVideoView';
+import { AutoEditorView } from './components/AutoEditorView';
 import { ProjectDetailView } from './components/ProjectDetailView';
 import { BatchGeneratorView } from './components/BatchGeneratorView';
 import { ContentIdeasView } from './components/ContentIdeasView';
@@ -353,6 +354,10 @@ export function App() {
               initialTopic={initialCreateTopic}
               onGenerate={handleGenerateVideo}
               isGenerating={Boolean(activeJobProjectId && isModalOpen)}
+            />
+          ) : currentTab === 'autoedit' ? (
+            <AutoEditorView
+              onOpenProject={id => setSelectedProjectId(id)}
             />
           ) : currentTab === 'batch' ? (
             <BatchGeneratorView

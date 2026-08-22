@@ -27,7 +27,7 @@ export type LanguageCode =
 
 export type VideoPlatform = 'tiktok' | 'reels' | 'shorts' | 'all';
 export type AspectRatio = '9:16' | '16:9' | '1:1';
-export type VideoDuration = 15 | 30 | 45 | 60 | 90;
+export type VideoDuration = 'AUTO' | 15 | 30 | 45 | 60 | 90 | number;
 
 export type ContentStyle =
   | 'Viral'
@@ -51,7 +51,26 @@ export type ContentStyle =
 export type VoiceGender = 'Male' | 'Female' | 'Neutral';
 export type VoiceStyle = 'Natural' | 'Energetic' | 'Professional' | 'Dramatic' | 'Calm' | 'Emotional';
 export type SubtitlePreset = 'Viral' | 'Bold' | 'Clean' | 'Minimal' | 'Karaoke' | 'Documentary';
-export type MusicCategory = 'None' | 'Cinematic' | 'Energetic' | 'Emotional' | 'Suspense' | 'Corporate' | 'Funny' | 'Travel' | 'Technology' | 'Motivational';
+export type MusicCategory =
+  | 'None'
+  | 'Cinematic'
+  | 'Energetic'
+  | 'Emotional'
+  | 'Suspense'
+  | 'Corporate'
+  | 'Funny'
+  | 'Travel'
+  | 'Technology'
+  | 'Motivational'
+  | 'Scary'
+  | 'Space'
+  | 'Science'
+  | 'Health'
+  | 'Animal'
+  | 'FunFact'
+  | 'History'
+  | 'Education'
+  | 'General';
 export type QualityMode = 'FAST' | 'BALANCED' | 'HIGH';
 export type VisualMode = 'AUTO' | 'STOCK_FIRST' | 'AI_VIDEO_FIRST' | 'AI_IMAGE_FIRST';
 
@@ -142,12 +161,46 @@ export interface VisualBible {
 }
 
 export interface ResearchSource {
+  id?: string;
   title: string;
   url?: string;
+  sourceName?: string;
   snippet: string;
   isFact: boolean;
-  type: 'FACT' | 'OPINION' | 'SPECULATION' | 'CREATIVE_CONTENT';
+  type: 'FACT' | 'OPINION' | 'SPECULATION' | 'CREATIVE_CONTENT' | 'EDUCATIONAL' | 'OFFICIAL' | 'WIKIPEDIA';
   confidence: number;
+  license?: string;
+  creator?: string;
+}
+
+export interface AIResearchResult {
+  topic: string;
+  status: 'READY' | 'SEARCHING' | 'FACT_CHECKING' | 'FAILED';
+  summary: string;
+  sourcesFoundCount: number;
+  relevantSourcesCount: number;
+  visualSourcesCount: number;
+  selectedVisualCount: number;
+  factChecked: boolean;
+  factCheckNotes?: string;
+  sources: ResearchSource[];
+  relevantFacts: string[];
+}
+
+export interface VisualSourcingItem {
+  sceneId: number;
+  searchQuery: string;
+  selectedUrl: string;
+  thumbnailUrl: string;
+  type: 'video' | 'image';
+  source: 'stock_api' | 'public_domain' | 'creative_commons' | 'stock_media' | 'ai_generated' | 'procedural';
+  providerName: string;
+  license: string;
+  attribution?: string;
+  relevanceScore: number;
+  validationStatus: 'PASSED' | 'WARNING' | 'REPLACED';
+  resolution: string;
+  fingerprint: string;
 }
 
 export interface HookOption {
@@ -230,6 +283,8 @@ export interface Project {
     detectedLanguage: LanguageCode;
   };
   research?: ResearchSource[];
+  aiResearch?: AIResearchResult;
+  visualSourcing?: VisualSourcingItem[];
   hooks?: HookOption[];
   selectedHookId?: string;
   script?: {
@@ -247,6 +302,9 @@ export interface Project {
   // Output media
   videoUrl?: string;
   thumbnailUrl?: string;
+  videoTitle?: string;
+  thumbnailTitle?: string;
+  category?: string;
   captionsSrtUrl?: string;
   captionsVttUrl?: string;
   backgroundMusicUrl?: string;
@@ -342,3 +400,128 @@ export interface BatchGenerateItem {
   videoUrl?: string;
   error?: string;
 }
+
+// ==========================================
+// AI AUTO EDITOR TYPES & DATA CONTRACTS
+// ==========================================
+export type AutoEditorStyle =
+  | 'Professional'
+  | 'Viral Shorts'
+  | 'Cinematic'
+  | 'Clean'
+  | 'Educational'
+  | 'Product Promo'
+  | 'Storytelling'
+  | 'Funny'
+  | 'Fast Paced';
+
+export interface UploadedMediaItem {
+  id: string;
+  originalName: string;
+  filePath: string;
+  url: string;
+  type: 'video' | 'image';
+  sizeBytes: number;
+  duration?: number;
+  width?: number;
+  height?: number;
+  aspectRatio?: string;
+  thumbnailUrl?: string;
+  hasAudio?: boolean;
+}
+
+export interface TranscriptSegment {
+  id: string;
+  startTime: number;
+  endTime: number;
+  text: string;
+  confidence?: number;
+  speaker?: string;
+  isImportant?: boolean;
+  score?: number;
+}
+
+export interface ContentAnalysisResult {
+  topic: string;
+  mainSubject: string;
+  importantMoments: string[];
+  suggestedHook: string;
+  suggestedCategory: string;
+  suggestedDuration: number;
+  emotions: string[];
+  keywords: string[];
+  silenceRanges: { start: number; end: number }[];
+  speechPace: string;
+  visualQuality: string;
+  audioQuality: string;
+}
+
+export interface AutoEditorCut {
+  id: string;
+  sceneIndex: number;
+  type: 'HOOK' | 'MAIN_CONTENT' | 'B_ROLL' | 'CTA';
+  startTime: number;
+  endTime: number;
+  duration: number;
+  transcriptText: string;
+  score: number;
+  bRollQuery?: string;
+  bRollAssetUrl?: string;
+  bRollAssetType?: 'video' | 'image';
+  cameraMotion?: 'zoom_in' | 'zoom_out' | 'pan_left' | 'pan_right' | 'ken_burns' | 'static';
+  subtitleText?: string;
+  isKept: boolean;
+  notes?: string;
+}
+
+export interface AutoEditorProject {
+  id: string;
+  jobId: string;
+  title: string;
+  videoTitle?: string;
+  thumbnailTitle?: string;
+  style: AutoEditorStyle;
+  targetDuration: VideoDuration;
+  autoCta: boolean;
+  status: ProjectStatus;
+  progress: number;
+  stageName: string;
+  statusMessage?: string;
+  
+  // Media Input
+  mediaType: 'video' | 'images';
+  uploadedMedia: UploadedMediaItem[];
+  
+  // Analysis & Processing
+  analysis?: ContentAnalysisResult;
+  transcript?: TranscriptSegment[];
+  cuts: AutoEditorCut[];
+  
+  // Audio & Music
+  musicCategory?: MusicCategory;
+  musicTrackName?: string;
+  musicUrl?: string;
+  voiceCleaned?: boolean;
+  
+  // Subtitle
+  subtitlePreset?: SubtitlePreset;
+  subtitlesBurned?: boolean;
+  
+  // Final Output
+  outputVideoUrl?: string;
+  outputThumbnailUrl?: string;
+  finalDuration?: number;
+  outputWidth?: number;
+  outputHeight?: number;
+  
+  // Social Package
+  socialPackage?: SocialPackage;
+  
+  // Quality Check
+  qcResult?: QCResult;
+  error?: string;
+  
+  createdAt: string;
+  updatedAt: string;
+}
+
