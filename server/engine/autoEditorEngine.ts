@@ -323,31 +323,53 @@ export class AutoEditorEngine {
     }
   }
 
+  private ensureClient(): GoogleGenAI | null {
+    const currentKey = process.env.GEMINI_API_KEY;
+    if (!currentKey) return null;
+    if (!this.ai) {
+      try {
+        this.ai = new GoogleGenAI({
+          apiKey: currentKey,
+          httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+        });
+      } catch {
+        this.ai = null;
+      }
+    }
+    return this.ai;
+  }
+
   /**
    * Generates structured AI output with multi-model cascade fallback
    */
   private async generateWithModelCascade(prompt: string, schema: any): Promise<any> {
-    if (!this.ai) return null;
-    const models = ['gemini-3.7-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite'];
+    const client = this.ensureClient();
+    if (!client) return null;
+    const models = ['gemini-3.7-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
     for (const model of models) {
-      try {
-        const response = await this.ai.models.generateContent({
-          model,
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: schema
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const response = await client.models.generateContent({
+            model,
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: schema
+            }
+          });
+          if (response && response.text) {
+            return JSON.parse(response.text);
           }
-        });
-        if (response && response.text) {
-          return JSON.parse(response.text);
-        }
-      } catch (err: any) {
-        const msg = err?.message || String(err);
-        const isQuotaOrRateLimit = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
-        if (isQuotaOrRateLimit) {
-          console.warn(`[AutoEditor] Model ${model} reached rate limit, attempting cascade fallback...`);
-          continue;
+        } catch (err: any) {
+          const msg = err?.message || String(err);
+          const isTransient = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('503') || msg.includes('fetch failed') || msg.includes('timeout');
+          if (isTransient) {
+            if (attempt < 2) {
+              await new Promise(r => setTimeout(r, 600 * attempt));
+              continue;
+            }
+          }
+          break;
         }
       }
     }
@@ -870,10 +892,19 @@ Provide a structured content analysis in JSON:
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '22',
+        '-profile:v', 'high',
+        '-level', '4.0',
+        '-pix_fmt', 'yuv420p',
+        '-color_primaries', '1',
+        '-color_trc', '1',
+        '-colorspace', '1',
         '-c:a', 'aac',
         '-b:a', '192k',
-        '-pix_fmt', 'yuv420p',
+        '-ar', '48000',
+        '-ac', '2',
         '-t', totalDuration.toString(),
+        '-movflags', '+faststart',
+        '-max_muxing_queue_size', '1024',
         finalOutputPath
       ];
 
@@ -905,11 +936,14 @@ Provide a structured content analysis in JSON:
             '-y',
             '-ss', (cut.startTime || 0).toString(),
             '-i', mediaSource,
-            '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
+            '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,format=yuv420p',
             '-t', cutDuration.toString(),
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
+            '-profile:v', 'high',
+            '-level', '4.0',
             '-pix_fmt', 'yuv420p',
+            '-r', '30',
             '-an',
             segPath
           ];
@@ -918,11 +952,14 @@ Provide a structured content analysis in JSON:
             '-y',
             '-loop', '1',
             '-i', fs.existsSync(mediaSource) ? mediaSource : primaryFile.filePath,
-            '-vf', `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(max(${zoomExpr},1),1.15)':d=${Math.round(cutDuration * 30)}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30`,
+            '-vf', `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(max(${zoomExpr},1),1.15)':d=${Math.round(cutDuration * 30)}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1,format=yuv420p`,
             '-t', cutDuration.toString(),
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
+            '-profile:v', 'high',
+            '-level', '4.0',
             '-pix_fmt', 'yuv420p',
+            '-r', '30',
             '-an',
             segPath
           ];
@@ -953,10 +990,10 @@ Provide a structured content analysis in JSON:
 
       if (hasBgMusic) {
         inputs.push('-stream_loop', '-1', '-i', resolvedMusicPath!);
-        audioFilter = `[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,volume=0.8[aout]`;
+        audioFilter = `[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,volume=0.8[aout]`;
       } else {
-        inputs.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100');
-        audioFilter = `[1:a]volume=1.0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]`;
+        inputs.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000');
+        audioFilter = `[1:a]volume=1.0,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[aout]`;
       }
 
       const vFilter = hasSubs ? `[0:v]ass=${escapedAss}[vout]` : `[0:v]null[vout]`;
@@ -968,10 +1005,19 @@ Provide a structured content analysis in JSON:
         '-map', '[aout]',
         '-c:v', 'libx264',
         '-preset', 'fast',
+        '-profile:v', 'high',
+        '-level', '4.0',
+        '-pix_fmt', 'yuv420p',
+        '-color_primaries', '1',
+        '-color_trc', '1',
+        '-colorspace', '1',
         '-c:a', 'aac',
         '-b:a', '192k',
-        '-pix_fmt', 'yuv420p',
+        '-ar', '48000',
+        '-ac', '2',
         '-t', totalDuration.toString(),
+        '-movflags', '+faststart',
+        '-max_muxing_queue_size', '1024',
         finalOutputPath
       ];
 

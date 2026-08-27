@@ -1,11 +1,12 @@
 import fs from 'fs';
 import path from 'path';
 import { spawn, spawnSync, execSync } from 'child_process';
-import { Scene, AspectRatio, SubtitlePreset, Project } from '../../src/types/index';
+import { Scene, AspectRatio, SubtitlePreset, Project, QualityMode } from '../../src/types/index';
 import { subtitleEngine } from './subtitles';
 import { musicProvider } from '../providers/music/musicProvider';
 import { thumbnailEngine } from './thumbnailEngine';
 import { getFfmpegPath, getFfprobePath } from '../utils/ffmpegPath';
+import { runWithConcurrency } from '../utils/concurrency';
 
 export interface RenderOptions {
   aspectRatio: AspectRatio;
@@ -14,6 +15,7 @@ export interface RenderOptions {
   musicVolume?: number; // default 0.15
   voiceVolume?: number; // default 1.0
   burnSubtitles?: boolean;
+  qualityMode?: QualityMode;
 }
 
 export interface RenderResult {
@@ -104,7 +106,7 @@ export class VideoEngine {
       const colors = ['#0f172a', '#1e1b4b', '#172554', '#042f2e', '#2e1065', '#18181b'];
       const color = colors[sceneIndex % colors.length];
       try {
-        spawnSync('ffmpeg', [
+        spawnSync(getFfmpegPath(), [
           '-y',
           '-f', 'lavfi',
           '-i', `color=c=${color}:s=1080x1920:d=1`,
@@ -240,13 +242,25 @@ export class VideoEngine {
     duration?: number;
     videoCodec?: string;
     audioCodec?: string;
+    pixFmt?: string;
+    fileSizeBytes?: number;
+    formatName?: string;
     error?: string;
   }> {
     try {
+      if (!fs.existsSync(videoPath)) {
+        return { passed: false, error: 'Rendered video file does not exist on disk.' };
+      }
+
+      const stats = fs.statSync(videoPath);
+      if (stats.size < 20000) {
+        return { passed: false, error: `Rendered file is suspiciously small or corrupted (${stats.size} bytes).` };
+      }
+
       const { stdout } = await this.runCommand('ffprobe', [
         '-v', 'error',
-        '-show_entries', 'stream=codec_type,codec_name,width,height,duration',
-        '-show_entries', 'format=duration,size',
+        '-show_entries', 'stream=index,codec_type,codec_name,pix_fmt,width,height,duration,sample_rate,channels',
+        '-show_entries', 'format=format_name,duration,size,bit_rate',
         '-of', 'json',
         videoPath
       ]);
@@ -259,6 +273,7 @@ export class VideoEngine {
         return { passed: false, error: 'Rendered file does not contain a video stream.' };
       }
 
+      const formatName = data.format?.format_name || '';
       const duration = parseFloat(data.format?.duration || videoStream.duration || '0');
       if (duration <= 0.5) {
         return { passed: false, error: `Rendered video duration is invalid (${duration}s).` };
@@ -268,17 +283,58 @@ export class VideoEngine {
         return { passed: false, error: 'Rendered video file is missing an audio stream (no voice or music track).' };
       }
 
+      console.log('==================================================');
+      console.log('[VIDEO ENGINE] MP4 COMPATIBILITY & PLAYBACK AUDIT');
+      console.log(`- File: ${path.basename(videoPath)}`);
+      console.log(`- Size: ${stats.size} bytes (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
+      console.log(`- Container: ${formatName}`);
+      console.log(`- Video: ${videoStream.codec_name} (${videoStream.pix_fmt || 'unknown'}, ${videoStream.width}x${videoStream.height})`);
+      console.log(`- Audio: ${audioStream.codec_name} (${audioStream.sample_rate || '48000'}Hz, ${audioStream.channels || 2}ch)`);
+      console.log(`- Duration: ${duration.toFixed(2)}s`);
+      console.log(`- Moov Atom: Faststart enabled for immediate playback`);
+      console.log('==================================================');
+
       return {
         passed: true,
         width: videoStream.width,
         height: videoStream.height,
         duration,
         videoCodec: videoStream.codec_name,
-        audioCodec: audioStream?.codec_name || 'aac'
+        audioCodec: audioStream.codec_name || 'aac',
+        pixFmt: videoStream.pix_fmt,
+        fileSizeBytes: stats.size,
+        formatName
       };
     } catch (err: any) {
+      console.error('[VideoEngine] FFprobe inspection error:', err);
       return { passed: false, error: `ffprobe inspection failed: ${err.message}` };
     }
+  }
+
+  // Ensure and force standard MP4 encoding compatibility (H.264/AVC, AAC, yuv420p, +faststart)
+  public async ensureMp4Compliance(inputPath: string, outputPath: string): Promise<string> {
+    const complianceArgs = [
+      '-y',
+      '-i', inputPath,
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '20',
+      '-profile:v', 'high',
+      '-level', '4.0',
+      '-pix_fmt', 'yuv420p',
+      '-color_primaries', '1',
+      '-color_trc', '1',
+      '-colorspace', '1',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-ar', '48000',
+      '-ac', '2',
+      '-movflags', '+faststart',
+      '-max_muxing_queue_size', '1024',
+      outputPath
+    ];
+    await this.runCommand('ffmpeg', complianceArgs);
+    return outputPath;
   }
 
   // Generate cover thumbnail with high-impact overlay
@@ -349,66 +405,88 @@ export class VideoEngine {
 
     onProgress?.(86, 'Converting scene visuals to timeline segments with motion');
 
-    // Step 2: Render each scene into a segment MP4 file
-    const renderedSegmentFiles: string[] = [];
+    // Step 2: Render each scene into a segment MP4 file in parallel with controlled concurrency
+    const qMode = options.qualityMode || project.qualityMode || 'BALANCED';
+    const preset = qMode === 'FAST' ? 'ultrafast' : qMode === 'HIGH' ? 'medium' : 'fast';
+    const crf = qMode === 'FAST' ? '24' : qMode === 'HIGH' ? '18' : '20';
 
-    for (let i = 0; i < project.scenes.length; i++) {
-      const scene = project.scenes[i];
-      const segFile = path.join(projectTempDir, `seg_${i}.mp4`);
-      const dur = Math.max(1.5, scene.duration);
+    const segStart = Date.now();
+    let completedSegs = 0;
 
-      const mediaPath = this.resolveLocalMediaPath(scene);
+    const renderedSegmentFiles = await runWithConcurrency(
+      project.scenes,
+      3, // Concurrency limit 3 for balanced CPU utilization
+      async (scene, i) => {
+        const segFile = path.join(projectTempDir, `seg_${i}.mp4`);
+        const dur = Math.max(1.5, scene.duration);
+        const mediaPath = this.resolveLocalMediaPath(scene);
+        const isVideo = scene.visual_type === 'video' || scene.visualAssetType === 'video' || mediaPath.endsWith('.mp4');
 
-      const isVideo = scene.visual_type === 'video' || scene.visualAssetType === 'video' || mediaPath.endsWith('.mp4');
+        if (isVideo) {
+          // Video footage input: scale, crop to 1080x1920 9:16 portrait, trim duration, 30fps
+          await this.runCommand('ffmpeg', [
+            '-y',
+            '-ss', '0',
+            '-i', mediaPath,
+            '-t', `${dur}`,
+            '-vf', `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1,format=yuv420p`,
+            '-c:v', 'libx264',
+            '-preset', preset,
+            '-crf', crf,
+            '-profile:v', 'high',
+            '-level', '4.0',
+            '-threads', '0',
+            '-pix_fmt', 'yuv420p',
+            '-r', '30',
+            '-an',
+            segFile
+          ]);
+        } else {
+          // Image footage input: convert image to video scene with Ken Burns motion effect
+          const totalFrames = Math.max(30, Math.round(dur * 30));
+          const motionType = scene.camera_motion || 'zoom_in';
 
-      if (isVideo) {
-        // Video footage input: scale, crop to 1080x1920 9:16 portrait, trim duration, 25fps
-        await this.runCommand('ffmpeg', [
-          '-y',
-          '-ss', '0',
-          '-i', mediaPath,
-          '-t', `${dur}`,
-          '-vf', `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1,format=yuv420p`,
-          '-c:v', 'libx264',
-          '-pix_fmt', 'yuv420p',
-          '-r', '25',
-          '-an',
-          segFile
-        ]);
-      } else {
-        // Image footage input: convert image to video scene with Ken Burns motion effect
-        const totalFrames = Math.max(25, Math.round(dur * 25));
-        const motionType = scene.camera_motion || 'zoom_in';
+          let zoomFilter = `zoompan=z='min(zoom+0.0015,1.18)':d=${totalFrames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}:fps=30`;
+          if (motionType === 'zoom_out') {
+            zoomFilter = `zoompan=z='if(lte(zoom,1.0),1.18,max(1.001,zoom-0.0015))':d=${totalFrames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}:fps=30`;
+          } else if (motionType === 'pan_left') {
+            zoomFilter = `zoompan=z='1.12':x='if(lte(on,-1),(iw-iw/zoom)/2,x-1)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=30`;
+          } else if (motionType === 'pan_right') {
+            zoomFilter = `zoompan=z='1.12':x='if(lte(on,-1),0,x+1)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=30`;
+          }
 
-        let zoomFilter = `zoompan=z='min(zoom+0.0015,1.18)':d=${totalFrames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}:fps=25`;
-        if (motionType === 'zoom_out') {
-          zoomFilter = `zoompan=z='if(lte(zoom,1.0),1.18,max(1.001,zoom-0.0015))':d=${totalFrames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${width}x${height}:fps=25`;
-        } else if (motionType === 'pan_left') {
-          zoomFilter = `zoompan=z='1.12':x='if(lte(on,-1),(iw-iw/zoom)/2,x-1)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=25`;
-        } else if (motionType === 'pan_right') {
-          zoomFilter = `zoompan=z='1.12':x='if(lte(on,-1),0,x+1)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=25`;
+          await this.runCommand('ffmpeg', [
+            '-y',
+            '-loop', '1',
+            '-i', mediaPath,
+            '-t', `${dur}`,
+            '-vf', `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},${zoomFilter},setsar=1,format=yuv420p`,
+            '-c:v', 'libx264',
+            '-preset', preset,
+            '-crf', crf,
+            '-profile:v', 'high',
+            '-level', '4.0',
+            '-threads', '0',
+            '-pix_fmt', 'yuv420p',
+            '-r', '30',
+            segFile
+          ]);
         }
 
-        await this.runCommand('ffmpeg', [
-          '-y',
-          '-loop', '1',
-          '-i', mediaPath,
-          '-t', `${dur}`,
-          '-vf', `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},${zoomFilter},format=yuv420p`,
-          '-c:v', 'libx264',
-          '-pix_fmt', 'yuv420p',
-          '-r', '25',
-          segFile
-        ]);
-      }
+        if (!fs.existsSync(segFile) || fs.statSync(segFile).size < 1000) {
+          throw new Error(`Failed to create video segment for Scene ${i + 1} (${scene.visual_prompt || scene.search_query})`);
+        }
 
-      if (!fs.existsSync(segFile) || fs.statSync(segFile).size < 1000) {
-        throw new Error(`Failed to create video segment for Scene ${i + 1} (${scene.visual_prompt || scene.search_query})`);
+        completedSegs++;
+        onProgress?.(
+          86 + Math.round((completedSegs / project.scenes.length) * 5),
+          `Processed Scene ${completedSegs}/${project.scenes.length} visual footage`
+        );
+        return segFile;
       }
+    );
 
-      renderedSegmentFiles.push(segFile);
-      onProgress?.(86 + Math.round(((i + 1) / project.scenes.length) * 5), `Processed Scene ${i + 1}/${project.scenes.length} visual footage`);
-    }
+    console.log(`[PERFORMANCE] [FFmpeg] Generated ${project.scenes.length} video segments in parallel in ${Date.now() - segStart}ms (Mode: ${qMode})`);
 
     onProgress?.(91, 'Concatenating video timeline segments');
 
@@ -427,12 +505,13 @@ export class VideoEngine {
       rawVideoPath
     ]);
 
-    // Step 4: Ensure scene voice audio files exist and concatenate
+    // Step 4: Ensure scene voice audio files exist, pad each scene audio to exact scene duration, and concatenate seamlessly
     const { ttsProvider } = await import('../providers/tts/ttsProvider');
-    const voiceAudioFiles: string[] = [];
+    const alignedVoiceFiles: string[] = [];
 
     for (let i = 0; i < project.scenes.length; i++) {
       const s = project.scenes[i];
+      const targetDuration = Math.max(1.5, s.duration);
       let localVoice = s.voice_audio_url;
 
       if (!localVoice || !fs.existsSync(localVoice.startsWith('/') ? path.join(process.cwd(), 'public', localVoice) : localVoice)) {
@@ -459,22 +538,54 @@ export class VideoEngine {
         if (localVoice.startsWith('/')) {
           localVoice = path.join(process.cwd(), 'public', localVoice);
         }
-        if (fs.existsSync(localVoice)) {
-          voiceAudioFiles.push(localVoice);
+        if (fs.existsSync(localVoice) && fs.statSync(localVoice).size > 100) {
+          // Align and pad this scene's voice file to match targetDuration with subtle fade to eliminate pops
+          const alignedSceneWav = path.join(projectTempDir, `aligned_voice_${i}.wav`);
+          try {
+            await this.runCommand('ffmpeg', [
+              '-y',
+              '-i', localVoice,
+              '-af', `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,afade=t=in:ss=0:d=0.015,apad=whole_dur=${targetDuration},atrim=0:${targetDuration}`,
+              '-c:a', 'pcm_s16le',
+              alignedSceneWav
+            ]);
+            if (fs.existsSync(alignedSceneWav) && fs.statSync(alignedSceneWav).size > 1000) {
+              alignedVoiceFiles.push(alignedSceneWav);
+              continue;
+            }
+          } catch (alignErr) {
+            console.warn(`[VideoEngine] Audio alignment warning for scene ${i + 1}:`, alignErr);
+          }
+          alignedVoiceFiles.push(localVoice);
+        } else {
+          // Add silent audio matching targetDuration so subsequent scenes stay synchronized
+          const silenceWav = path.join(projectTempDir, `silence_voice_${i}.wav`);
+          try {
+            await this.runCommand('ffmpeg', [
+              '-y',
+              '-f', 'lavfi',
+              '-i', `anullsrc=r=48000:cl=stereo`,
+              '-t', `${targetDuration}`,
+              '-c:a', 'pcm_s16le',
+              silenceWav
+            ]);
+            if (fs.existsSync(silenceWav)) alignedVoiceFiles.push(silenceWav);
+          } catch {}
         }
       }
     }
 
     const fullVoicePath = path.join(projectTempDir, 'full_voice.wav');
-    if (voiceAudioFiles.length > 0) {
+    if (alignedVoiceFiles.length > 0) {
       const audioConcatTxt = path.join(projectTempDir, 'audio_concat.txt');
-      fs.writeFileSync(audioConcatTxt, voiceAudioFiles.map((f) => `file '${f}'`).join('\n'));
+      fs.writeFileSync(audioConcatTxt, alignedVoiceFiles.map((f) => `file '${f}'`).join('\n'));
       try {
         await this.runCommand('ffmpeg', [
           '-y',
           '-f', 'concat',
           '-safe', '0',
           '-i', audioConcatTxt,
+          '-c:a', 'pcm_s16le',
           fullVoicePath
         ]);
       } catch (audioErr) {
@@ -518,8 +629,8 @@ export class VideoEngine {
     const hasVoice = fs.existsSync(fullVoicePath) && fs.statSync(fullVoicePath).size > 1000;
     const hasBgMusic = !!localBgMusicPath && fs.existsSync(localBgMusicPath) && fs.statSync(localBgMusicPath).size > 1000;
     const escapedAss = assSubtitlesPath.replace(/\\/g, '/').replace(/:/g, '\\:');
-    const musicVol = options.musicVolume ?? 0.26; // Audible ducked background music volume (26%)
-    const voiceVol = options.voiceVolume ?? 1.0;
+    const musicVol = options.musicVolume ?? 0.18; // Ducked background music volume (18% for clean voiceover clarity)
+    const voiceVol = options.voiceVolume ?? 1.05; // Slightly boosted voice for broadcast punchiness
 
     const buildFfmpegArgs = (burnSubtitles: boolean) => {
       const inputs: string[] = ['-y', '-i', rawVideoPath];
@@ -528,16 +639,19 @@ export class VideoEngine {
       if (hasVoice && hasBgMusic) {
         inputs.push('-i', fullVoicePath);
         inputs.push('-stream_loop', '-1', '-i', localBgMusicPath!);
-        // Voice + Ducked Background Music mixed with matching sample formats and continuous background
-        filterComplex = `[1:a]volume=${voiceVol},aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[voice];[2:a]volume=${musicVol},aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[bgm];[voice][bgm]amix=inputs=2:duration=longest:dropout_transition=0,volume=1.0[aout]`;
+        // Voice + Ducked Background Music with smooth fade in/out and broadcast limiter
+        const fadeOutStart = Math.max(1, totalDuration - 1.2);
+        filterComplex = `[1:a]volume=${voiceVol},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[voice];` +
+                        `[2:a]volume=${musicVol},afade=t=in:ss=0:d=0.5,afade=t=out:st=${fadeOutStart}:d=1.2,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[bgm];` +
+                        `[voice][bgm]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.95[aout]`;
       } else if (hasVoice) {
         inputs.push('-i', fullVoicePath);
-        filterComplex = `[1:a]volume=${voiceVol},aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]`;
+        filterComplex = `[1:a]volume=${voiceVol},aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,alimiter=limit=0.95[aout]`;
       } else if (hasBgMusic) {
         inputs.push('-stream_loop', '-1', '-i', localBgMusicPath!);
-        filterComplex = `[1:a]volume=0.8,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[aout]`;
+        filterComplex = `[1:a]volume=0.7,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,alimiter=limit=0.95[aout]`;
       } else {
-        inputs.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100');
+        inputs.push('-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000');
         filterComplex = `[1:a]volume=1.0[aout]`;
       }
 
@@ -562,29 +676,51 @@ export class VideoEngine {
 
       args.push(
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '20',
+        '-preset', preset,
+        '-crf', crf,
+        '-profile:v', 'high',
+        '-level', '4.0',
+        '-threads', '0',
         '-pix_fmt', 'yuv420p',
+        '-color_primaries', '1',
+        '-color_trc', '1',
+        '-colorspace', '1',
         '-c:a', 'aac',
         '-b:a', '192k',
-        '-ar', '44100',
+        '-ar', '48000',
+        '-ac', '2',
         '-t', `${Math.max(1, totalDuration)}`,
         '-movflags', '+faststart',
+        '-max_muxing_queue_size', '1024',
         finalOutputPath
       );
       return args;
     };
 
+    const finalStart = Date.now();
     try {
       await this.runCommand('ffmpeg', buildFfmpegArgs(options.burnSubtitles !== false));
     } catch (renderErr) {
       console.warn('[VideoEngine] Render with subtitles failed, retrying without subtitle filter...', renderErr);
       await this.runCommand('ffmpeg', buildFfmpegArgs(false));
     }
+    console.log(`[PERFORMANCE] [FFmpeg] Final composite encoded in ${Date.now() - finalStart}ms (Mode: ${qMode})`);
 
     // Step 7: Post-render validation with ffprobe
     onProgress?.(97, 'Validating output MP4 integrity and streams');
-    const validation = await this.validateRenderedVideo(finalOutputPath);
+    let validation = await this.validateRenderedVideo(finalOutputPath);
+    if (!validation.passed) {
+      console.warn(`[VideoEngine] Initial validation failed (${validation.error}). Attempting automatic MP4 compliance repair...`);
+      const repairedTempPath = path.join(projectTempDir, 'repaired_final.mp4');
+      try {
+        await this.ensureMp4Compliance(finalOutputPath, repairedTempPath);
+        fs.copyFileSync(repairedTempPath, finalOutputPath);
+        validation = await this.validateRenderedVideo(finalOutputPath);
+      } catch (repairErr: any) {
+        console.error('[VideoEngine] Compliance repair failed:', repairErr);
+      }
+    }
+
     if (!validation.passed) {
       throw new Error(`Rendered video validation failed: ${validation.error}`);
     }

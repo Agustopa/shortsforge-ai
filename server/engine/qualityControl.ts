@@ -99,18 +99,29 @@ export class QualityControlEngine {
     };
   }
 
-  // Post-render QC: Validates rendered video file integrity
-  public verifyRenderedVideo(videoPublicUrl: string): { passed: boolean; message: string } {
+  // Post-render QC: Validates rendered video file integrity and MP4 compatibility
+  public async verifyRenderedVideo(videoPublicUrl: string): Promise<{ passed: boolean; message: string; details?: any }> {
     try {
-      const fullPath = path.join(process.cwd(), 'public', videoPublicUrl);
+      const fullPath = path.join(process.cwd(), 'public', videoPublicUrl.replace(/^\/+/, ''));
       if (!fs.existsSync(fullPath)) {
         return { passed: false, message: 'Rendered video file not found on disk.' };
       }
       const stats = fs.statSync(fullPath);
-      if (stats.size < 5000) {
-        return { passed: false, message: 'Video file size is suspiciously small.' };
+      if (stats.size < 20000) {
+        return { passed: false, message: `Video file size is suspiciously small or corrupted (${stats.size} bytes).` };
       }
-      return { passed: true, message: `Video rendered successfully (${(stats.size / 1024 / 1024).toFixed(2)} MB).` };
+      
+      const { videoEngine } = await import('./videoEngine');
+      const validation = await videoEngine.validateRenderedVideo(fullPath);
+      if (!validation.passed) {
+        return { passed: false, message: `Video stream validation failed: ${validation.error}`, details: validation };
+      }
+
+      return {
+        passed: true,
+        message: `Video rendered and verified (${(stats.size / 1024 / 1024).toFixed(2)} MB, ${validation.videoCodec}/${validation.audioCodec}, ${validation.duration?.toFixed(1)}s, yuv420p).`,
+        details: validation
+      };
     } catch (err: any) {
       return { passed: false, message: `Post-render verification error: ${err.message}` };
     }

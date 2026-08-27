@@ -153,6 +153,22 @@ export class ResearchEngine {
     }
   }
 
+  private ensureClient(): GoogleGenAI | null {
+    const currentKey = process.env.GEMINI_API_KEY;
+    if (!currentKey) return null;
+    if (!this.ai) {
+      try {
+        this.ai = new GoogleGenAI({
+          apiKey: currentKey,
+          httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+        });
+      } catch {
+        this.ai = null;
+      }
+    }
+    return this.ai;
+  }
+
   /**
    * AI research synthesis with multi-model cascade
    */
@@ -162,9 +178,10 @@ export class ResearchEngine {
     analysis: TopicAnalysis,
     wikiData: WikipediaArticle | null
   ): Promise<ResearchSource[]> {
-    if (!this.ai) return [];
+    const client = this.ensureClient();
+    if (!client) return [];
 
-    const models = ['gemini-3.7-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite'];
+    const models = ['gemini-3.7-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
     const wikiContext = wikiData ? `Wikipedia Context:\nTitle: ${wikiData.title}\nExtract: ${wikiData.extract}` : '';
 
     const prompt = `[TOPIC ISOLATION RESEARCH DIRECTIVE]
@@ -191,26 +208,33 @@ Output strictly valid JSON with this schema:
 ]`;
 
     for (const model of models) {
-      try {
-        const response = await this.ai.models.generateContent({
-          model,
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            temperature: 0.2
-          }
-        });
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const response = await client.models.generateContent({
+            model,
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              temperature: 0.2
+            }
+          });
 
-        if (response && response.text) {
-          const parsed = JSON.parse(response.text);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            return parsed;
+          if (response && response.text) {
+            const parsed = JSON.parse(response.text);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              return parsed;
+            }
           }
-        }
-      } catch (err: any) {
-        const msg = err?.message || '';
-        if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
-          continue; // cascade
+        } catch (err: any) {
+          const msg = err?.message || '';
+          const isTransient = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('503') || msg.includes('fetch failed') || msg.includes('timeout');
+          if (isTransient) {
+            if (attempt < 2) {
+              await new Promise(r => setTimeout(r, 600 * attempt));
+              continue;
+            }
+          }
+          break;
         }
       }
     }

@@ -37,6 +37,7 @@ import {
   AutoEditorCut
 } from '../types/index';
 import { safeFetchJson } from '../utils/apiClient';
+import { downloadVideoFile } from '../utils/downloadHelper';
 
 interface AutoEditorViewProps {
   onOpenProject?: (projectId: string) => void;
@@ -100,10 +101,42 @@ export const AutoEditorView: React.FC<AutoEditorViewProps> = () => {
           fetchProjects();
         }
       }
-    }, 2000);
+    }, 800);
 
     return () => clearInterval(interval);
   }, [activeProject, fetchProjects]);
+
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadMsg, setDownloadMsg] = useState<string | null>(null);
+
+  const handleDownloadAutoEditorVideo = async () => {
+    if (!activeProject || !activeProject.outputVideoUrl) return;
+    setIsDownloading(true);
+    setDownloadMsg('Starting download...');
+
+    const downloadEndpoint = `/api/v1/auto-editor/projects/${activeProject.id}/download`;
+    const cleanTitle = (activeProject.videoTitle || activeProject.title || 'ShortsForge_AutoEdit')
+      .replace(/[^a-zA-Z0-9_\-\s]/g, '')
+      .trim()
+      .replace(/\s+/g, '_')
+      .slice(0, 45);
+    const filename = `ShortsForge_AutoEdit_${cleanTitle}_${activeProject.id}.mp4`;
+
+    await downloadVideoFile(downloadEndpoint, {
+      filename,
+      onProgress: (_pct, msg) => setDownloadMsg(msg),
+      onSuccess: () => {
+        setIsDownloading(false);
+        setDownloadMsg('Download complete!');
+        setTimeout(() => setDownloadMsg(null), 3000);
+      },
+      onError: (err) => {
+        setIsDownloading(false);
+        setDownloadMsg(`Error: ${err}`);
+        setTimeout(() => setDownloadMsg(null), 5000);
+      }
+    });
+  };
 
   // Handle File Selection
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -760,24 +793,32 @@ export const AutoEditorView: React.FC<AutoEditorViewProps> = () => {
                 </h2>
               </div>
 
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 {activeProject.outputVideoUrl && (
-                  <a
-                    id="btn-download-video"
-                    href={activeProject.outputVideoUrl}
-                    download={`ShortsForge_${activeProject.jobId}.mp4`}
-                    className="py-2.5 px-4 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs flex items-center gap-2 shadow-lg shadow-orange-950/30 cursor-pointer"
-                  >
-                    <Download className="w-4 h-4 text-slate-950" />
-                    <span>Download MP4</span>
-                  </a>
+                  <div className="relative inline-flex flex-col items-end">
+                    <button
+                      id="btn-download-video"
+                      onClick={handleDownloadAutoEditorVideo}
+                      disabled={isDownloading}
+                      className="py-2.5 px-4 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs flex items-center gap-2 shadow-lg shadow-orange-950/30 cursor-pointer disabled:opacity-50 transition-all"
+                      title="Download H.264 MP4 (Universal Playback Compatible)"
+                    >
+                      <Download className={`w-4 h-4 text-slate-950 ${isDownloading ? 'animate-bounce' : ''}`} />
+                      <span>{isDownloading ? 'Downloading MP4...' : 'Download MP4'}</span>
+                    </button>
+                    {downloadMsg && (
+                      <span className="absolute -bottom-5 right-0 text-[10px] font-mono text-amber-400 whitespace-nowrap bg-slate-950/90 px-2 py-0.5 rounded border border-slate-800">
+                        {downloadMsg}
+                      </span>
+                    )}
+                  </div>
                 )}
                 {activeProject.outputThumbnailUrl && (
                   <a
                     id="btn-download-thumbnail"
                     href={activeProject.outputThumbnailUrl}
                     download={`Thumbnail_${activeProject.jobId}.jpg`}
-                    className="py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs flex items-center gap-2 border border-slate-700"
+                    className="py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs flex items-center gap-2 border border-slate-700 cursor-pointer"
                   >
                     <ImageIcon className="w-4 h-4" />
                     <span>Thumbnail</span>

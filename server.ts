@@ -22,6 +22,11 @@ async function startServer() {
   app.use(express.json({ limit: '100mb' }));
   app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
+  // Immediate lightweight health check for Cloud Run & load balancers
+  app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok' });
+  });
+
   // Ensure public generated, uploads, and audio directories exist
   const publicDir = path.join(process.cwd(), 'public');
   const generatedDir = path.join(publicDir, 'generated');
@@ -31,11 +36,34 @@ async function startServer() {
   if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
   if (!fs.existsSync(audioDir)) fs.mkdirSync(audioDir, { recursive: true });
 
-  // Serve static assets directly
-  app.use('/generated', express.static(generatedDir));
-  app.use('/uploads', express.static(uploadsDir));
-  app.use('/audio', express.static(audioDir));
-  app.use(express.static(publicDir));
+  // Serve static assets directly with high-performance video streaming & byte-range headers
+  const staticOptions = {
+    acceptRanges: true,
+    setHeaders: (res: any, filePath: string) => {
+      if (filePath.endsWith('.mp4')) {
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+      } else if (filePath.endsWith('.mp3')) {
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Accept-Ranges', 'bytes');
+      } else if (filePath.endsWith('.wav')) {
+        res.setHeader('Content-Type', 'audio/wav');
+        res.setHeader('Accept-Ranges', 'bytes');
+      } else if (filePath.endsWith('.jpg') || filePath.endsWith('.jpeg')) {
+        res.setHeader('Content-Type', 'image/jpeg');
+      } else if (filePath.endsWith('.png')) {
+        res.setHeader('Content-Type', 'image/png');
+      } else if (filePath.endsWith('.srt')) {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      }
+    }
+  };
+
+  app.use('/generated', express.static(generatedDir, staticOptions));
+  app.use('/uploads', express.static(uploadsDir, staticOptions));
+  app.use('/audio', express.static(audioDir, staticOptions));
+  app.use(express.static(publicDir, staticOptions));
 
   // Mount API routes
   app.use('/api/v1', apiRouter);

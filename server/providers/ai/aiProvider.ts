@@ -83,21 +83,38 @@ export class GoogleAIProvider implements AIProvider {
   private apiKey: string | undefined;
 
   constructor() {
-    this.apiKey = process.env.GEMINI_API_KEY;
-    if (this.apiKey) {
-      this.ai = new GoogleGenAI({
-        apiKey: this.apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build'
-          }
-        }
-      });
+    this.ensureClient();
+  }
+
+  private ensureClient(): GoogleGenAI | null {
+    const currentKey = process.env.GEMINI_API_KEY;
+    if (!currentKey) {
+      this.ai = null;
+      this.apiKey = undefined;
+      return null;
     }
+    if (!this.ai || this.apiKey !== currentKey) {
+      this.apiKey = currentKey;
+      try {
+        this.ai = new GoogleGenAI({
+          apiKey: this.apiKey,
+          httpOptions: {
+            headers: {
+              'User-Agent': 'aistudio-build'
+            }
+          }
+        });
+      } catch (e) {
+        console.error('Error initializing GoogleGenAI client:', e);
+        this.ai = null;
+      }
+    }
+    return this.ai;
   }
 
   public isAvailable(): boolean {
-    return !!this.ai && !!this.apiKey;
+    const client = this.ensureClient();
+    return !!client && !!this.apiKey;
   }
 
   private detectLanguageFromText(text: string): LanguageCode {
@@ -128,28 +145,30 @@ export class GoogleAIProvider implements AIProvider {
     contents: any;
     config?: any;
   }): Promise<any> {
-    if (!this.ai) {
-      throw new Error('AI client not initialized');
+    const client = this.ensureClient();
+    if (!client || !this.apiKey) {
+      throw new Error('AI client not initialized or GEMINI_API_KEY missing');
     }
 
     const modelsToTry = [
       'gemini-3.7-flash',
-      'gemini-flash-latest',
-      'gemini-3.1-flash-lite'
+      'gemini-3.1-flash-lite',
+      'gemini-flash-latest'
     ];
 
     let lastError: any = null;
 
     for (const model of modelsToTry) {
-      // Retry up to 2 times for transient errors (503 high demand, 429 rate limit, 500, network)
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-          const response = await this.ai.models.generateContent({
+          const response = await client.models.generateContent({
             model,
             contents: params.contents,
             config: params.config
           });
-          return response;
+          if (response) {
+            return response;
+          }
         } catch (err: any) {
           lastError = err;
           const errMessage = err?.message || String(err);
@@ -162,16 +181,22 @@ export class GoogleAIProvider implements AIProvider {
                           errMessage.includes('429') || 
                           errMessage.includes('Quota exceeded') ||
                           errMessage.includes('RESOURCE_EXHAUSTED');
+          const isNetworkOrFetch = errMessage.includes('fetch failed') ||
+                                   errMessage.includes('ENOTFOUND') ||
+                                   errMessage.includes('ECONNRESET') ||
+                                   errMessage.includes('ETIMEDOUT') ||
+                                   errMessage.includes('socket hang up') ||
+                                   errMessage.includes('timeout');
 
-          if (isHighDemand || isQuota) {
-            console.warn(`[AIProvider] ${model} attempt ${attempt} encountered ${isHighDemand ? '503 High Demand' : '429 Rate Limit'}. Backing off...`);
+          if (isHighDemand || isQuota || isNetworkOrFetch) {
+            console.warn(`[AIProvider] ${model} attempt ${attempt} encountered transient issue (${isHighDemand ? '503 High Demand' : isQuota ? '429 Rate Limit' : 'Network Fetch'}). Retrying...`);
             if (attempt < 2) {
-              await new Promise(r => setTimeout(r, 600 * attempt));
+              await new Promise(r => setTimeout(r, 700 * attempt));
               continue;
             }
           } else {
             console.warn(`[AIProvider] Request failed on ${model} (attempt ${attempt}): ${errMessage.substring(0, 120)}`);
-            break; // Move to next model cascade immediately
+            break;
           }
         }
       }

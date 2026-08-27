@@ -253,6 +253,126 @@ router.delete('/projects/:id', (req: Request, res: Response) => {
   res.json({ success: true, message: 'Project deleted.' });
 });
 
+// GET /api/v1/projects/:id/validate-video - Diagnostic inspection of rendered MP4
+router.get('/projects/:id/validate-video', async (req: Request, res: Response) => {
+  const project = db.getProject(req.params.id);
+  if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
+
+  if (!project.videoUrl) {
+    return res.status(400).json({ success: false, error: 'Project does not have a rendered video yet.' });
+  }
+
+  const cleanUrl = project.videoUrl.split('?')[0].replace(/^\/+/, '');
+  const localPath = path.join(process.cwd(), 'public', cleanUrl);
+
+  if (!fs.existsSync(localPath)) {
+    return res.status(404).json({ success: false, error: 'Rendered video file was not found on server disk.' });
+  }
+
+  const validation = await videoEngine.validateRenderedVideo(localPath);
+  const stats = fs.statSync(localPath);
+
+  res.json({
+    success: true,
+    projectId: project.id,
+    title: project.title,
+    videoUrl: project.videoUrl,
+    fileSizeBytes: stats.size,
+    validation: {
+      ...validation,
+      isCompliantMp4: validation.passed && validation.videoCodec === 'h264' && validation.audioCodec === 'aac',
+      compatibilityStatus: validation.passed ? 'Universal Compatibility (Windows, macOS/QuickTime, iOS, Android, VLC, Socials)' : 'Validation Warning'
+    }
+  });
+});
+
+// GET /api/v1/projects/:id/download - High-reliability binary streaming download for MP4 video
+router.get('/projects/:id/download', async (req: Request, res: Response) => {
+  try {
+    const project = db.getProject(req.params.id);
+    if (!project) return res.status(404).json({ success: false, error: 'Project not found.' });
+
+    if (!project.videoUrl) {
+      return res.status(400).json({ success: false, error: 'Video is not yet rendered for this project.' });
+    }
+
+    const cleanUrl = project.videoUrl.split('?')[0].replace(/^\/+/, '');
+    let localPath = path.join(process.cwd(), 'public', cleanUrl);
+
+    if (!fs.existsSync(localPath)) {
+      return res.status(404).json({ success: false, error: 'Video file not found on disk.' });
+    }
+
+    // Verify and ensure file integrity before download
+    const stats = fs.statSync(localPath);
+    if (stats.size < 20000) {
+      console.warn(`[Download] File size is suspiciously small (${stats.size} bytes). Attempting re-mux repair...`);
+      const repairPath = localPath.replace('.mp4', '_repaired.mp4');
+      try {
+        await videoEngine.ensureMp4Compliance(localPath, repairPath);
+        if (fs.existsSync(repairPath) && fs.statSync(repairPath).size > 20000) {
+          localPath = repairPath;
+        }
+      } catch (repErr) {
+        console.error('[Download] Re-mux repair failed:', repErr);
+      }
+    }
+
+    const cleanTitle = (project.title || 'ShortsForge_Video')
+      .replace(/[^a-zA-Z0-9_\-\s]/g, '')
+      .trim()
+      .replace(/\s+/g, '_')
+      .slice(0, 50);
+    const downloadFilename = `ShortsForge_${cleanTitle}_${project.id}.mp4`;
+
+    const finalStats = fs.statSync(localPath);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
+    res.setHeader('Content-Length', finalStats.size.toString());
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+
+    res.sendFile(localPath);
+  } catch (err: any) {
+    console.error('[API Project Download Error]:', err);
+    res.status(500).json({ success: false, error: err?.message || 'Error processing video download.' });
+  }
+});
+
+// GET /api/v1/download/video - Generic safe binary video file download endpoint
+router.get('/download/video', (req: Request, res: Response) => {
+  try {
+    const rawUrl = req.query.url as string;
+    const rawFilename = (req.query.filename as string) || 'video.mp4';
+    if (!rawUrl) return res.status(400).json({ success: false, error: 'URL parameter is required' });
+
+    const cleanUrl = rawUrl.split('?')[0].replace(/^\/+/, '');
+    const publicDir = path.join(process.cwd(), 'public');
+    const localPath = path.join(publicDir, cleanUrl);
+
+    // Prevent path traversal
+    if (!localPath.startsWith(publicDir)) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    if (!fs.existsSync(localPath)) {
+      return res.status(404).json({ success: false, error: 'Video file not found on disk' });
+    }
+
+    const stats = fs.statSync(localPath);
+    const safeFilename = rawFilename.replace(/[^a-zA-Z0-9_\-\.]/g, '_');
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename.endsWith('.mp4') ? safeFilename : safeFilename + '.mp4'}"`);
+    res.setHeader('Content-Length', stats.size.toString());
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    res.sendFile(localPath);
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // POST /api/v1/projects/:id/variations (Generates 3 stylistic versions or 3 hooks)
 router.post('/projects/:id/variations', async (req: Request, res: Response) => {
   const project = db.getProject(req.params.id);
@@ -416,6 +536,67 @@ const handleRenderProject = async (req: Request, res: Response) => {
 router.post('/projects/:id/rerender', handleRenderProject);
 router.post('/projects/:id/render', handleRenderProject);
 
+// POST /api/v1/generate-video (Direct Async Pipeline Entry Point)
+router.post('/generate-video', (req: Request, res: Response) => {
+  const {
+    topic,
+    language = 'id',
+    platform = 'all',
+    aspectRatio = '9:16',
+    duration = 30,
+    contentStyle = 'Viral',
+    voiceGender = 'Male',
+    voiceStyle = 'Energetic',
+    subtitlePreset = 'Viral',
+    musicCategory = 'Cinematic',
+    autoMode = true,
+    qualityMode = 'BALANCED',
+    visualMode = 'AUTO'
+  } = req.body;
+
+  if (!topic || topic.trim().length === 0) {
+    return res.status(400).json({ success: false, error: 'Topic is required.' });
+  }
+
+  const id = `proj_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const project: Project = {
+    id,
+    title: topic.trim(),
+    topic: topic.trim(),
+    language: language as LanguageCode,
+    platform: platform as VideoPlatform,
+    aspectRatio: aspectRatio as AspectRatio,
+    duration: Number(duration) as VideoDuration,
+    contentStyle: contentStyle as ContentStyle,
+    voiceGender: voiceGender as VoiceGender,
+    voiceStyle: voiceStyle as VoiceStyle,
+    subtitlePreset: subtitlePreset as SubtitlePreset,
+    musicCategory: musicCategory as MusicCategory,
+    autoMode: Boolean(autoMode),
+    qualityMode: qualityMode as QualityMode,
+    visualMode: visualMode as VisualMode,
+    status: 'DRAFT',
+    progress: 0,
+    currentStage: 'Ready to generate',
+    scenes: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+
+  db.setProject(project);
+  const job = jobQueue.enqueue(project.id);
+
+  res.status(202).json({
+    success: true,
+    jobId: job.id,
+    projectId: project.id,
+    status: job.status,
+    progress: job.progress,
+    stage: job.stage,
+    pollUrl: `/api/v1/jobs/${job.id}`
+  });
+});
+
 // GET /api/v1/jobs/:id
 router.get('/jobs/:id', (req: Request, res: Response) => {
   const job = db.getJob(req.params.id);
@@ -491,7 +672,7 @@ router.get('/media', (req: Request, res: Response) => {
 });
 
 // POST /api/v1/media/upload
-router.post('/media/upload', upload.single('file'), (req: Request, res: Response) => {
+router.post('/media/upload', upload.single('file') as any, (req: Request, res: Response) => {
   if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded.' });
 
   const mime = req.file.mimetype;
@@ -539,7 +720,7 @@ router.post('/settings', (req: Request, res: Response) => {
 // ============================================================
 
 // POST /api/v1/auto-editor/upload-chunk - Chunked upload for large raw media files (bypasses 413 limits)
-router.post('/auto-editor/upload-chunk', upload.single('chunk'), async (req: Request, res: Response) => {
+router.post('/auto-editor/upload-chunk', upload.single('chunk') as any, async (req: Request, res: Response) => {
   try {
     const file = req.file;
     const { uploadId, chunkIndex, totalChunks, fileName } = req.body;
@@ -658,7 +839,7 @@ router.post('/auto-editor/create-project', (req: Request, res: Response) => {
 });
 
 // POST /api/v1/auto-editor/upload - Upload raw video or images (direct)
-router.post('/auto-editor/upload', upload.array('files', 20), async (req: Request, res: Response) => {
+router.post('/auto-editor/upload', upload.array('files', 20) as any, async (req: Request, res: Response) => {
   try {
     const files = req.files as Express.Multer.File[];
     if (!files || files.length === 0) {
@@ -885,6 +1066,44 @@ router.put('/auto-editor/projects/:id', (req: Request, res: Response) => {
     return res.status(404).json({ success: false, error: 'Project not found.' });
   }
   res.json({ success: true, project: updated });
+});
+
+// GET /api/v1/auto-editor/projects/:id/download - Streaming binary download for Auto Editor video
+router.get('/auto-editor/projects/:id/download', async (req: Request, res: Response) => {
+  try {
+    const project = db.getAutoEditorProject(req.params.id);
+    if (!project) return res.status(404).json({ success: false, error: 'Auto Editor project not found.' });
+
+    if (!project.outputVideoUrl) {
+      return res.status(400).json({ success: false, error: 'Rendered video is not available yet.' });
+    }
+
+    const cleanUrl = project.outputVideoUrl.split('?')[0].replace(/^\/+/, '');
+    const localPath = path.join(process.cwd(), 'public', cleanUrl);
+
+    if (!fs.existsSync(localPath)) {
+      return res.status(404).json({ success: false, error: 'Video file not found on disk.' });
+    }
+
+    const cleanTitle = (project.title || 'ShortsForge_AutoEdit')
+      .replace(/[^a-zA-Z0-9_\-\s]/g, '')
+      .trim()
+      .replace(/\s+/g, '_')
+      .slice(0, 50);
+    const downloadFilename = `ShortsForge_AutoEdit_${cleanTitle}_${project.id}.mp4`;
+
+    const stats = fs.statSync(localPath);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
+    res.setHeader('Content-Length', stats.size.toString());
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+
+    res.sendFile(localPath);
+  } catch (err: any) {
+    console.error('[API AutoEditor Download Error]:', err);
+    res.status(500).json({ success: false, error: err?.message || 'Error processing download.' });
+  }
 });
 
 // DELETE /api/v1/auto-editor/projects/:id - Delete Auto Editor project

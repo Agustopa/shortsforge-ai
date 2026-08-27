@@ -1,6 +1,8 @@
 {
-  "name": "ShortsForge AI",
-  "description": "Turn one idea into a complete short video.",
+  "name": "Remix shortsforge-ai update",
+  "description": "Imported from GitHub: Agustopa/shortsforge-ai",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

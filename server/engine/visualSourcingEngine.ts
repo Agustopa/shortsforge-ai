@@ -5,6 +5,7 @@ import http from 'http';
 import { spawn } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
 import { Scene, AspectRatio, VisualMode, VisualSourcingItem } from '../../src/types/index';
+import { getFfmpegPath } from '../utils/ffmpegPath';
 
 export interface SourcedVisualResult {
   sceneId: number;
@@ -460,7 +461,7 @@ export class VisualSourcingEngine {
 
     // Use FFmpeg to synthesize a pristine visual gradient background with high quality
     await new Promise<void>((resolve) => {
-      const proc = spawn('ffmpeg', [
+      const proc = spawn(getFfmpegPath(), [
         '-y',
         '-f', 'lavfi',
         '-i', `color=c=${colorScheme.bg}:s=${width}x${height}:d=1`,

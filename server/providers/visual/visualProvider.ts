@@ -6,6 +6,8 @@ import { spawn } from 'child_process';
 import { GoogleGenAI, GenerateVideosOperation } from '@google/genai';
 import { AspectRatio, Scene, VisualMode } from '../../../src/types/index';
 import { visualSourcingEngine } from '../../engine/visualSourcingEngine';
+import { getFfmpegPath } from '../../utils/ffmpegPath';
+import { pipelineCache, withTimeout } from '../../utils/concurrency';
 
 export interface VisualAssetResult {
   id: string;
@@ -209,32 +211,51 @@ export class UnifiedVisualProvider {
   private apiKey: string | undefined;
   private outputDir: string;
   private imageCooldownUntil: number = 0;
+  private imageQuotaExhausted: boolean = false;
+  private veoCooldownUntil: number = 0;
+  private veoQuotaExhausted: boolean = false;
 
   constructor() {
-    this.apiKey = process.env.GEMINI_API_KEY;
-    if (this.apiKey) {
-      this.ai = new GoogleGenAI({
-        apiKey: this.apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build'
-          }
-        }
-      });
-    }
-
     this.outputDir = path.join(process.cwd(), 'public', 'generated', 'visuals');
     if (!fs.existsSync(this.outputDir)) {
       fs.mkdirSync(this.outputDir, { recursive: true });
     }
   }
 
+  private ensureClient(): GoogleGenAI | null {
+    const currentKey = process.env.GEMINI_API_KEY;
+    if (!currentKey) return null;
+    if (!this.ai || this.apiKey !== currentKey) {
+      this.apiKey = currentKey;
+      this.imageQuotaExhausted = false;
+      this.imageCooldownUntil = 0;
+      this.veoQuotaExhausted = false;
+      this.veoCooldownUntil = 0;
+      try {
+        this.ai = new GoogleGenAI({
+          apiKey: this.apiKey,
+          httpOptions: {
+            headers: {
+              'User-Agent': 'aistudio-build'
+            }
+          }
+        });
+      } catch (e) {
+        console.error('Error initializing visual GoogleGenAI client:', e);
+        this.ai = null;
+      }
+    }
+    return this.ai;
+  }
+
   public isVeoAvailable(): boolean {
-    return !!this.ai && !!this.apiKey;
+    const client = this.ensureClient();
+    return !!client && !!this.apiKey && !this.veoQuotaExhausted && Date.now() >= this.veoCooldownUntil;
   }
 
   public isImagenAvailable(): boolean {
-    return !!this.ai && !!this.apiKey && Date.now() >= this.imageCooldownUntil;
+    const client = this.ensureClient();
+    return !!client && !!this.apiKey && !this.imageQuotaExhausted && Date.now() >= this.imageCooldownUntil;
   }
 
   /**
@@ -246,100 +267,195 @@ export class UnifiedVisualProvider {
     visualMode: VisualMode = 'AUTO',
     aspectRatio: AspectRatio = '9:16',
     topicContext: string = '',
-    jobId: string = ''
+    jobId: string = '',
+    sceneIndex: number = 0,
+    totalScenes: number = 1
   ): Promise<VisualAssetResult> {
+    const startTime = Date.now();
     const prompt = scene.visual_prompt || scene.visual_description || 'High quality cinematic visual';
     const searchQuery = `${topicContext} ${scene.search_query || scene.visual_description || ''}`.trim();
     const uniqueSessionId = `${projectId}_${jobId || 'job'}_scene_${scene.scene_id}_${Date.now()}`;
 
-    // Strategy 1: AI Video first (Veo)
-    if (visualMode === 'AI_VIDEO_FIRST' && this.isVeoAvailable()) {
-      const veoResult = await this.tryGenerateVeoVideo(prompt, scene.scene_id, uniqueSessionId, aspectRatio);
-      if (veoResult) return veoResult;
+    // 0. Cache Check
+    const cacheKey = `${searchQuery}|${prompt}|${aspectRatio}|${visualMode}`;
+    const cached = pipelineCache.get<VisualAssetResult>('visuals', cacheKey);
+    if (cached && cached.localPath && fs.existsSync(cached.localPath) && fs.statSync(cached.localPath).size > 500) {
+      console.log(`[PERFORMANCE] [Visual Cache HIT] Retrieved visual for Scene ${scene.scene_id} in ${Date.now() - startTime}ms`);
+      return cached;
     }
 
-    // Strategy 2: AI Image first (Gemini Image)
-    if ((visualMode === 'AI_IMAGE_FIRST' || visualMode === 'AUTO') && this.isImagenAvailable()) {
-      const imageResult = await this.tryGenerateGeminiImage(
-        `${topicContext}: ${prompt}, vertical 9:16 portrait photography, highly detailed, 4k`,
-        scene.scene_id,
-        uniqueSessionId,
-        aspectRatio
-      );
-      if (imageResult) return imageResult;
-    }
+    let result: VisualAssetResult | null = null;
 
-    // Strategy 3: Pexels internet search (foto & video ASLI sesuai topic apa pun, tidak dibatasi kategori)
-    const pexelsResult = await this.tryPexelsSearch(searchQuery || topicContext, scene.scene_id, uniqueSessionId, aspectRatio);
-    if (pexelsResult) return pexelsResult;
+    // Determine if this scene is a key anchor scene eligible for Veo video AI generation (max 1-2 scenes per video: Scene 1 Hook, or middle climax)
+    const isVeoEligibleScene = sceneIndex === 0 || (totalScenes >= 5 && sceneIndex === Math.floor(totalScenes / 2));
 
-    // Strategy 4: Multi-Source Scene Visual Sourcing with Duplicate Rejection (fallback darurat kalau Pexels gagal/API key kosong)
-    try {
-      const sourced = await visualSourcingEngine.sourceVisualForScene({
-        scene,
-        topic: topicContext,
-        jobId: jobId || projectId,
-        projectId,
-        aspectRatio,
-        visualMode
-      });
-
-      if (sourced && fs.existsSync(sourced.localPath) && fs.statSync(sourced.localPath).size > 500) {
-        return {
-          id: `sourced-${Date.now()}-${scene.scene_id}`,
-          type: sourced.type,
-          url: sourced.url,
-          localPath: sourced.localPath,
-          thumbnailUrl: sourced.thumbnailUrl,
-          width: sourced.width,
-          height: sourced.height,
-          duration: sourced.duration,
-          source: sourced.type === 'video' ? 'stock_video' : 'stock_image',
-          provider: `${sourced.providerName} (${sourced.license})`,
-          status: 'completed',
-          fileSizeBytes: sourced.fileSizeBytes,
-          isMock: false
-        };
+    // Strategy Option A: AI Video first (Veo) - STRICTLY LIMITED to 1-2 key scenes per video
+    if (visualMode === 'AI_VIDEO_FIRST' && isVeoEligibleScene && this.isVeoAvailable()) {
+      try {
+        console.log(`[VisualProvider] Scene ${scene.scene_id} selected as Veo key hero scene (Index: ${sceneIndex + 1}/${totalScenes}).`);
+        const veoResult = await withTimeout(
+          this.tryGenerateVeoVideo(prompt, scene.scene_id, uniqueSessionId, aspectRatio, 45000),
+          48000,
+          'Veo video generation timeout'
+        );
+        if (veoResult) result = veoResult;
+      } catch (e) {
+        console.warn(`[VisualProvider] Veo timeout/error for scene ${scene.scene_id}, falling back immediately to Gemini Image / Pexels:`, e);
       }
-    } catch (sourceErr) {
-      console.warn('[VisualProvider] Visual sourcing engine fallback:', sourceErr);
     }
 
-    // Strategy 5: Dynamic Generative Thematic Graphic Fallback
-    return this.createProceduralVisual(scene, uniqueSessionId, aspectRatio, topicContext);
+    // Strategy Option B: AI Image first (Gemini Image) - used for AI_IMAGE_FIRST, or secondary scenes in AI_VIDEO_FIRST, or Veo fallback
+    if (!result && (visualMode === 'AI_IMAGE_FIRST' || visualMode === 'AI_VIDEO_FIRST') && this.isImagenAvailable()) {
+      try {
+        const imageResult = await withTimeout(
+          this.tryGenerateGeminiImage(
+            `${topicContext}: ${prompt}, vertical 9:16 portrait photography, highly detailed, 4k`,
+            scene.scene_id,
+            uniqueSessionId,
+            aspectRatio
+          ),
+          8000,
+          'Gemini image generation timeout'
+        );
+        if (imageResult) result = imageResult;
+      } catch (e) {
+        console.warn(`[VisualProvider] Gemini Image timeout/error for scene ${scene.scene_id}:`, e);
+      }
+    }
+
+    // Strategy 1 (AUTO primary / Fallback for AI modes): Fast Pexels internet search with strict 7s timeout
+    if (!result) {
+      try {
+        const pexelsResult = await withTimeout(
+          this.tryPexelsSearch(searchQuery || topicContext, scene.scene_id, uniqueSessionId, aspectRatio),
+          7000,
+          'Pexels search timeout'
+        );
+        if (pexelsResult) result = pexelsResult;
+      } catch (e) {
+        console.warn(`[VisualProvider] Pexels timeout for scene ${scene.scene_id}:`, e);
+      }
+    }
+
+    // Strategy 2: Multi-Source Scene Visual Sourcing with Duplicate Rejection
+    if (!result) {
+      try {
+        const sourced = await withTimeout(
+          visualSourcingEngine.sourceVisualForScene({
+            scene,
+            topic: topicContext,
+            jobId: jobId || projectId,
+            projectId,
+            aspectRatio,
+            visualMode
+          }),
+          5000,
+          'Visual sourcing engine timeout'
+        );
+
+        if (sourced && fs.existsSync(sourced.localPath) && fs.statSync(sourced.localPath).size > 500) {
+          result = {
+            id: `sourced-${Date.now()}-${scene.scene_id}`,
+            type: sourced.type,
+            url: sourced.url,
+            localPath: sourced.localPath,
+            thumbnailUrl: sourced.thumbnailUrl,
+            width: sourced.width,
+            height: sourced.height,
+            duration: sourced.duration,
+            source: sourced.type === 'video' ? 'stock_video' : 'stock_image',
+            provider: `${sourced.providerName} (${sourced.license})`,
+            status: 'completed',
+            fileSizeBytes: sourced.fileSizeBytes,
+            isMock: false
+          };
+        }
+      } catch (sourceErr) {
+        console.warn('[VisualProvider] Visual sourcing engine fallback:', sourceErr);
+      }
+    }
+
+    // Strategy 3: Try Gemini AI Image in AUTO mode only if stock was not found and Imagen is available
+    if (!result && visualMode === 'AUTO' && this.isImagenAvailable()) {
+      try {
+        const imageResult = await withTimeout(
+          this.tryGenerateGeminiImage(
+            `${topicContext}: ${prompt}, vertical 9:16 portrait photography, highly detailed, 4k`,
+            scene.scene_id,
+            uniqueSessionId,
+            aspectRatio
+          ),
+          8000,
+          'Gemini image generation timeout'
+        );
+        if (imageResult) result = imageResult;
+      } catch (e) {
+        console.warn(`[VisualProvider] Gemini Image fallback error for scene ${scene.scene_id}:`, e);
+      }
+    }
+
+    // Strategy 4: Dynamic Generative Thematic Graphic Fallback (Always 100% Reliable)
+    if (!result) {
+      result = await this.createProceduralVisual(scene, uniqueSessionId, aspectRatio, topicContext);
+    }
+
+    // Cache the result if valid
+    if (result && result.localPath && fs.existsSync(result.localPath)) {
+      pipelineCache.set('visuals', cacheKey, result);
+    }
+
+    console.log(`[PERFORMANCE] [Visual Sourced] Scene ${scene.scene_id} (${result.source}) in ${Date.now() - startTime}ms`);
+    return result;
   }
 
   /**
-   * Calls Google Veo video generation model
+   * Calls Google Veo video generation model with hard timeout limit (max 45s)
    */
   private async tryGenerateVeoVideo(
     prompt: string,
     sceneId: number,
     sessionId: string,
-    aspectRatio: AspectRatio
+    aspectRatio: AspectRatio,
+    maxWaitMs: number = 45000
   ): Promise<VisualAssetResult | null> {
-    if (!this.ai) return null;
+    const client = this.ensureClient();
+    if (!client) return null;
 
+    const startTime = Date.now();
     try {
-      console.log(`[VisualProvider] Initiating Google Veo video generation for Scene ${sceneId}...`);
+      console.log(`[VisualProvider] Initiating Google Veo video generation for Scene ${sceneId} (Timeout: ${maxWaitMs / 1000}s)...`);
       const veoRatio = aspectRatio === '9:16' ? '9:16' : aspectRatio === '16:9' ? '16:9' : '1:1';
       
-      let operation: GenerateVideosOperation = await this.ai.models.generateVideos({
-        model: 'veo-3.1-generate-001',
-        prompt: `${prompt}. Ultra realistic 4k cinematic footage, fluid motion, professional color grade, no artifacts.`,
-        config: {
-          aspectRatio: veoRatio as any,
-          personGeneration: 'ALLOW_ADULT' as any,
-          durationSeconds: 5
-        }
-      });
+      let operation: GenerateVideosOperation = await withTimeout(
+        client.models.generateVideos({
+          model: 'veo-3.1-lite-generate-preview',
+          prompt: `${prompt}. Ultra realistic 4k cinematic footage, fluid motion, professional color grade, no artifacts.`,
+          config: {
+            aspectRatio: veoRatio as any,
+            personGeneration: 'ALLOW_ADULT' as any,
+            durationSeconds: 5
+          }
+        }),
+        15000,
+        'Veo initial request timeout'
+      );
 
       let retries = 0;
-      while (!operation.done && retries < 15) {
-        await new Promise((res) => setTimeout(res, 5000));
-        operation = await this.ai.operations.getVideosOperation({
-          operation: operation
-        });
+      while (!operation.done) {
+        const elapsed = Date.now() - startTime;
+        if (elapsed >= maxWaitMs) {
+          console.warn(`[VisualProvider] Veo polling reached ${maxWaitMs / 1000}s timeout for Scene ${sceneId}. Aborting and switching to fast fallback.`);
+          return null;
+        }
+
+        await new Promise((res) => setTimeout(res, 4000));
+        operation = await withTimeout(
+          client.operations.getVideosOperation({
+            operation: operation
+          }),
+          10000,
+          'Veo polling status timeout'
+        );
         retries++;
       }
 
@@ -349,12 +465,16 @@ export class UnifiedVisualProvider {
         const localPath = path.join(this.outputDir, filename);
         const publicUrl = `/generated/visuals/${filename}`;
 
-        const downloadSuccess = await this.downloadRemoteFile(
-          `${videoUri}&key=${this.apiKey}`,
-          localPath
+        const downloadSuccess = await withTimeout(
+          this.downloadRemoteFile(
+            `${videoUri}&key=${this.apiKey}`,
+            localPath
+          ),
+          12000,
+          'Veo download timeout'
         );
 
-        if (downloadSuccess && fs.existsSync(localPath)) {
+        if (downloadSuccess && fs.existsSync(localPath) && fs.statSync(localPath).size > 1000) {
           const stats = fs.statSync(localPath);
           return {
             id: `veo-${Date.now()}`,
@@ -366,22 +486,29 @@ export class UnifiedVisualProvider {
             height: aspectRatio === '9:16' ? 1920 : 1080,
             duration: 5,
             source: 'google_veo',
-            provider: 'Google Veo 3.1 Neural Video',
+            provider: 'Google Veo Neural Video',
             status: 'completed',
             fileSizeBytes: stats.size,
             isMock: false,
-            modelName: 'veo-3.1-generate-001'
+            modelName: 'veo-3.1-lite-generate-preview'
           };
         }
       }
     } catch (err: any) {
-      console.error(`[VisualProvider] Veo generation FAILED for scene, falling back to stock: ${err?.message || err}`);
+      const msg = err?.message || String(err);
+      if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota')) {
+        this.veoQuotaExhausted = true;
+        this.veoCooldownUntil = Date.now() + 3600000;
+        console.log('[VisualProvider] Google Veo API quota exhausted (429). Circuit breaker engaged: switching video visuals to fast image/stock.');
+      } else {
+        console.warn(`[VisualProvider] Veo generation error/timeout: ${msg}`);
+      }
     }
     return null;
   }
 
   /**
-   * Calls Gemini Image Generation (gemini-3.1-flash-image-preview)
+   * Calls Gemini Image Generation with bounded timeout
    */
   private async tryGenerateGeminiImage(
     prompt: string,
@@ -389,67 +516,80 @@ export class UnifiedVisualProvider {
     sessionId: string,
     aspectRatio: AspectRatio
   ): Promise<VisualAssetResult | null> {
-    if (!this.ai) return null;
+    if (!this.isImagenAvailable()) return null;
+    const client = this.ensureClient();
+    if (!client) return null;
 
-    try {
-      const imgRatio = aspectRatio === '9:16' ? '9:16' : aspectRatio === '16:9' ? '16:9' : '1:1';
+    const imgModels = ['gemini-3.1-flash-image', 'gemini-3.1-flash-lite-image'];
+    const imgRatio = aspectRatio === '9:16' ? '9:16' : aspectRatio === '16:9' ? '16:9' : '1:1';
 
-      const response = await this.ai.models.generateContent({
-        model: 'gemini-3.1-flash-image-preview',
-        contents: {
-          parts: [
-            {
-              text: `${prompt}. Cinematic vertical 9:16 composition, 4k ultra-high resolution, beautiful volumetric light, professional photography.`
+    for (const model of imgModels) {
+      if (!this.isImagenAvailable()) break;
+      try {
+        const response = await withTimeout(
+          client.models.generateContent({
+            model,
+            contents: {
+              parts: [
+                {
+                  text: `${prompt}. Cinematic vertical 9:16 composition, 4k ultra-high resolution, beautiful volumetric light, professional photography.`
+                }
+              ]
+            },
+            config: {
+              imageConfig: {
+                aspectRatio: imgRatio as any
+              }
             }
-          ]
-        },
-        config: {
-          imageConfig: {
-            aspectRatio: imgRatio as any
+          }),
+          7000,
+          `Gemini image generation timeout (${model})`
+        );
+
+        for (const part of response.candidates?.[0]?.content?.parts || []) {
+          if (part.inlineData?.data) {
+            const base64Data = part.inlineData.data;
+            const buffer = Buffer.from(base64Data, 'base64');
+            const filename = `gemini_${sessionId}.png`;
+            const localPath = path.join(this.outputDir, filename);
+            const publicUrl = `/generated/visuals/${filename}`;
+
+            fs.writeFileSync(localPath, buffer);
+
+            return {
+              id: `gemini-img-${Date.now()}`,
+              type: 'image',
+              url: publicUrl,
+              localPath,
+              thumbnailUrl: publicUrl,
+              width: aspectRatio === '9:16' ? 1080 : 1920,
+              height: aspectRatio === '9:16' ? 1920 : 1080,
+              source: 'gemini_image',
+              provider: 'Gemini Neural Image',
+              status: 'completed',
+              fileSizeBytes: buffer.length,
+              isMock: false,
+              modelName: model
+            };
           }
         }
-      });
-
-      for (const part of response.candidates?.[0]?.content?.parts || []) {
-        if (part.inlineData?.data) {
-          const base64Data = part.inlineData.data;
-          const buffer = Buffer.from(base64Data, 'base64');
-          const filename = `gemini_${sessionId}.png`;
-          const localPath = path.join(this.outputDir, filename);
-          const publicUrl = `/generated/visuals/${filename}`;
-
-          fs.writeFileSync(localPath, buffer);
-
-          return {
-            id: `gemini-img-${Date.now()}`,
-            type: 'image',
-            url: publicUrl,
-            localPath,
-            thumbnailUrl: publicUrl,
-            width: aspectRatio === '9:16' ? 1080 : 1920,
-            height: aspectRatio === '9:16' ? 1920 : 1080,
-            source: 'gemini_image',
-            provider: 'Gemini Neural Image',
-            status: 'completed',
-            fileSizeBytes: buffer.length,
-            isMock: false,
-            modelName: 'gemini-3.1-flash-image-preview'
-          };
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota')) {
+          this.imageQuotaExhausted = true;
+          this.imageCooldownUntil = Date.now() + 3600000;
+          console.log('[VisualProvider] Gemini Image API quota reached (429/RESOURCE_EXHAUSTED). Circuit breaker engaged: switching visual pipeline to stock footage & Pexels.');
+          break; // Break loop immediately, do not try other models that will also fail
+        } else {
+          console.warn(`[VisualProvider] ${model} image generation attempt failed: ${msg}`);
         }
-      }
-    } catch (err: any) {
-      console.error(`[VisualProvider] Gemini image generation FAILED for scene, falling back to stock: ${err?.message || err}`);
-      const msg = err?.message || String(err);
-      if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota')) {
-        this.imageCooldownUntil = Date.now() + 300000;
       }
     }
     return null;
   }
 
   /**
-   * Mencari video/foto ASLI dari internet lewat Pexels API berdasarkan topic & scene description apa pun,
-   * tidak dibatasi kategori hardcoded. Ini adalah sumber visual utama sebelum jatuh ke curated fallback.
+   * Mencari video/foto ASLI dari internet lewat Pexels API dengan strict timeout (maks 5s per request)
    */
   private async tryPexelsSearch(
     query: string,
@@ -462,7 +602,7 @@ export class UnifiedVisualProvider {
 
     const cleanQuery = query.replace(/[^\w\s]/g, ' ').trim().slice(0, 100) || 'cinematic background';
 
-    const fetchJson = (url: string): Promise<any> => {
+    const fetchJson = (url: string, timeoutMs: number = 4500): Promise<any> => {
       return new Promise((resolve) => {
         const req = https.get(url, { headers: { Authorization: pexelsKey } }, (res) => {
           let body = '';
@@ -476,7 +616,7 @@ export class UnifiedVisualProvider {
           });
         });
         req.on('error', () => resolve(null));
-        req.setTimeout(8000, () => {
+        req.setTimeout(timeoutMs, () => {
           req.destroy();
           resolve(null);
         });
@@ -484,9 +624,9 @@ export class UnifiedVisualProvider {
     };
 
     try {
-      // 1) Coba cari VIDEO dulu (lebih hidup/menarik untuk short-form)
+      // 1) Coba cari VIDEO dulu (maks 4.5s)
       const videoUrl = `https://api.pexels.com/videos/search?query=${encodeURIComponent(cleanQuery)}&orientation=portrait&per_page=6`;
-      const videoData = await fetchJson(videoUrl);
+      const videoData = await fetchJson(videoUrl, 4500);
       const videoResult = videoData?.videos?.[0];
       if (videoResult) {
         const files = videoResult.video_files || [];
@@ -498,7 +638,7 @@ export class UnifiedVisualProvider {
           const filename = `pexels_video_${sessionId}.mp4`;
           const localPath = path.join(this.outputDir, filename);
           const publicUrl = `/generated/visuals/${filename}`;
-          const ok = await this.downloadRemoteFile(bestFile.link, localPath);
+          const ok = await withTimeout(this.downloadRemoteFile(bestFile.link, localPath), 5000, 'Pexels video download timeout');
           if (ok && fs.existsSync(localPath) && fs.statSync(localPath).size > 2000) {
             const stats = fs.statSync(localPath);
             return {
@@ -520,9 +660,9 @@ export class UnifiedVisualProvider {
         }
       }
 
-      // 2) Kalau tidak ada video cocok, coba cari FOTO
+      // 2) Kalau tidak ada video cocok, coba cari FOTO (maks 4.5s)
       const photoUrl = `https://api.pexels.com/v1/search?query=${encodeURIComponent(cleanQuery)}&orientation=portrait&per_page=6`;
-      const photoData = await fetchJson(photoUrl);
+      const photoData = await fetchJson(photoUrl, 4500);
       const photoResult = photoData?.photos?.[0];
       if (photoResult) {
         const srcUrl = photoResult.src?.portrait || photoResult.src?.large2x || photoResult.src?.original;
@@ -530,7 +670,7 @@ export class UnifiedVisualProvider {
           const filename = `pexels_photo_${sessionId}.jpg`;
           const localPath = path.join(this.outputDir, filename);
           const publicUrl = `/generated/visuals/${filename}`;
-          const ok = await this.downloadRemoteFile(srcUrl, localPath);
+          const ok = await withTimeout(this.downloadRemoteFile(srcUrl, localPath), 5000, 'Pexels photo download timeout');
           if (ok && fs.existsSync(localPath) && fs.statSync(localPath).size > 2000) {
             const stats = fs.statSync(localPath);
             return {
@@ -551,7 +691,7 @@ export class UnifiedVisualProvider {
         }
       }
     } catch (err: any) {
-      console.error(`[VisualProvider] Pexels search FAILED for query "${cleanQuery}": ${err?.message || err}`);
+      console.warn(`[VisualProvider] Pexels search timeout/error for query "${cleanQuery}": ${err?.message || err}`);
     }
 
     return null;
@@ -743,7 +883,7 @@ export class UnifiedVisualProvider {
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
       await new Promise<void>((resolve) => {
-        const proc = spawn('ffmpeg', [
+        const proc = spawn(getFfmpegPath(), [
           '-y',
           '-f', 'lavfi',
           '-i', `color=c=${color}:s=1080x1920:d=1`,

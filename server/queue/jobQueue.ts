@@ -12,6 +12,7 @@ import { thumbnailEngine } from '../engine/thumbnailEngine';
 import { qualityControlEngine } from '../engine/qualityControl';
 import { researchEngine } from '../engine/researchEngine';
 import { GenerationJob, Project, ProjectStatus, CurrentTopic, GenerationIsolationDebug, VisualSourcingItem } from '../../src/types/index';
+import { runWithConcurrency } from '../utils/concurrency';
 
 class JobQueue extends EventEmitter {
   private queue: string[] = [];
@@ -141,6 +142,7 @@ class JobQueue extends EventEmitter {
   }
 
   private async executePipeline(job: GenerationJob) {
+    const totalPipelineStart = Date.now();
     const project = db.getProject(job.projectId);
     if (!project) throw new Error('Project not found');
 
@@ -165,14 +167,19 @@ class JobQueue extends EventEmitter {
       currentTopic
     };
 
-    // Stage 1: Topic Analysis (5% -> 12%)
-    this.updateStage(job, 'ANALYZING', 8, `Analyzing topic: "${currentTopic.text}"`);
-    const analysis = await aiProvider.analyzeTopic(currentTopic.text, {
-      language: project.language,
-      platform: project.platform,
-      duration: project.duration,
-      contentStyle: project.contentStyle
-    }, context);
+    // Stage 1 & 2: Topic Analysis and Deep Research in Parallel (5% -> 22%)
+    const s1Start = Date.now();
+    this.updateStage(job, 'ANALYZING', 12, `Analyzing topic and gathering verified research in parallel for "${currentTopic.text}"`);
+    
+    const [analysis, aiResearch] = await Promise.all([
+      aiProvider.analyzeTopic(currentTopic.text, {
+        language: project.language,
+        platform: project.platform,
+        duration: project.duration,
+        contentStyle: project.contentStyle
+      }, context),
+      researchEngine.executeResearch(currentTopic.text, { language: project.language } as any, job.id, project.id)
+    ]);
 
     project.analysis = {
       niche: analysis.niche,
@@ -183,16 +190,13 @@ class JobQueue extends EventEmitter {
       detectedLanguage: analysis.language
     };
     project.language = analysis.language;
-    db.setProject(project);
-
-    // Stage 2: AI Internet Research & Fact Verification (12% -> 22%)
-    this.updateStage(job, 'RESEARCHING', 18, `Conducting factual internet research specifically for "${currentTopic.text}"`);
-    let aiResearch = await researchEngine.executeResearch(currentTopic.text, analysis, job.id, project.id);
     project.aiResearch = aiResearch;
     project.research = aiResearch.sources;
     db.setProject(project);
+    console.log(`[PERFORMANCE] [Stages 1 & 2: Parallel Analysis + Research] Completed in ${Date.now() - s1Start}ms`);
 
     // Stage 3: Viral Hook Generation & Scriptwriting with Automated Relevance Check (22% -> 38%)
+    const s3Start = Date.now();
     this.updateStage(job, 'WRITING_SCRIPT', 28, `Generating high-retention hooks exclusively for "${currentTopic.text}"`);
     const { hooks, selectedHook } = await aiProvider.generateHooks(analysis, project.research, context);
     project.hooks = hooks;
@@ -215,12 +219,6 @@ class JobQueue extends EventEmitter {
     project.script = script;
     project.title = script.title || currentTopic.text;
 
-    // Generate Auto Catchy Titles and Category for Thumbnails & Video Metadata
-    const titleMeta = await thumbnailEngine.generateTitles(currentTopic.text, script, project.language);
-    project.videoTitle = titleMeta.videoTitle;
-    project.thumbnailTitle = titleMeta.thumbnailTitle;
-    project.category = titleMeta.category;
-
     // Isolation debug data
     const isolationDebug: GenerationIsolationDebug = {
       currentTopic: currentTopic.text,
@@ -237,8 +235,10 @@ class JobQueue extends EventEmitter {
     };
     project.isolationDebug = isolationDebug;
     db.setProject(project);
+    console.log(`[PERFORMANCE] [Stage 3: Scriptwriting] Completed in ${Date.now() - s3Start}ms`);
 
     // Stage 4: Scene Planning & Visual Bible (38% -> 50%)
+    const s4Start = Date.now();
     this.updateStage(job, 'PLANNING_SCENES', 45, `Architecting visual continuity and scene timeline for "${currentTopic.text}"`);
     const { scenes, visualBible } = await aiProvider.planScenes(script, analysis, project.visualMode, context);
     
@@ -251,23 +251,49 @@ class JobQueue extends EventEmitter {
     project.scenes = scenes;
     project.visualBible = visualBible;
     db.setProject(project);
+    console.log(`[PERFORMANCE] [Stage 4: Scene Planning] Completed in ${Date.now() - s4Start}ms`);
 
-    // Stage 5: Visual Media Sourcing & Multi-Source Retrieval (50% -> 65%)
-    this.updateStage(job, 'COLLECTING_MEDIA', 50, `Sourcing verified 1080x1920 scene visuals for "${currentTopic.text}"`);
+    // =========================================================================
+    // PARALLEL EXECUTION: Stages 5 (Visuals), 6 (TTS Voice), 8 (BGM), and Titles
+    // =========================================================================
+    const parallelAssetStart = Date.now();
+    this.updateStage(job, 'COLLECTING_MEDIA', 52, `Generating visuals, voice narration, and soundtrack in parallel...`);
+
+    // Task A: Generate Titles & Category in parallel
+    const titleTask = thumbnailEngine.generateTitles(currentTopic.text, script, project.language).then(titleMeta => {
+      project.videoTitle = titleMeta.videoTitle;
+      project.thumbnailTitle = titleMeta.thumbnailTitle;
+      project.category = titleMeta.category;
+    });
+
+    // Task B: Background Music in parallel
+    if (!project.musicCategory || project.musicCategory === 'None' || project.musicCategory === 'Cinematic' || project.musicCategory === 'General') {
+      project.musicCategory = musicProvider.detectMusicCategoryFromTopic(currentTopic.text);
+    }
+    const musicTask = musicProvider.ensureMusicTrackAvailable(project.musicCategory, project.id).then(musicInfo => {
+      if (musicInfo) {
+        project.backgroundMusicUrl = musicInfo.url;
+      } else {
+        const musicTrack = musicProvider.getTrackForProject(project.musicCategory, project.id);
+        if (musicTrack) project.backgroundMusicUrl = musicTrack.url;
+      }
+    });
+
+    // Task C: Scene Visual Media Sourcing in parallel for ALL scenes simultaneously
+    let visualCompleted = 0;
     const visualSourcingList: VisualSourcingItem[] = [];
+    const totalScenes = project.scenes.length;
 
-    for (let i = 0; i < project.scenes.length; i++) {
-      const scene = project.scenes[i];
-      const prog = 50 + Math.round(((i + 1) / project.scenes.length) * 15);
-      this.updateStage(job, 'GENERATING_VISUALS', prog, `Sourcing visual for Scene ${i + 1}/${project.scenes.length}: "${scene.search_query || scene.visual_description.substring(0, 40)}..."`);
-
+    const visualPromises = project.scenes.map(async (scene, i) => {
       const visualRes = await visualProvider.generateSceneVisual(
         scene,
         project.id,
         project.visualMode,
         project.aspectRatio,
         currentTopic.text,
-        job.id
+        job.id,
+        i,
+        totalScenes
       );
 
       scene.visual_url = visualRes.url;
@@ -289,7 +315,6 @@ class JobQueue extends EventEmitter {
         error: visualRes.error
       };
 
-      // Add to structured visual sourcing tracker
       visualSourcingList.push({
         sceneId: scene.scene_id,
         searchQuery: scene.search_query || scene.visual_description.substring(0, 50),
@@ -306,19 +331,14 @@ class JobQueue extends EventEmitter {
         fingerprint: `asset_${job.id}_s${scene.scene_id}`
       });
 
-      this.updateStage(job, 'GENERATING_VISUALS', prog, `Scene ${i + 1}/${project.scenes.length} visual verified: ${visualRes.provider}`);
-    }
+      visualCompleted++;
+      const prog = 52 + Math.round((visualCompleted / totalScenes) * 15);
+      this.updateStage(job, 'GENERATING_VISUALS', prog, `Sourced visuals: Scene ${visualCompleted}/${totalScenes} (${visualRes.provider})`);
+    });
+    const visualTask = Promise.all(visualPromises);
 
-    project.visualSourcing = visualSourcingList;
-    if (project.aiResearch) {
-      project.aiResearch.selectedVisualCount = visualSourcingList.length;
-    }
-    db.setProject(project);
-
-    // Stage 6: Voice Generation & Word Timestamps (65% -> 75%)
-    this.updateStage(job, 'GENERATING_VOICE', 68, `Synthesizing ${project.voiceGender} voiceover narration`);
-    for (let i = 0; i < project.scenes.length; i++) {
-      const scene = project.scenes[i];
+    // Task D: TTS Voice Narration in parallel for ALL scenes simultaneously
+    const ttsPromises = project.scenes.map(async (scene) => {
       const ttsRes = await ttsProvider.generateSpeech(
         scene.narration,
         {
@@ -331,7 +351,18 @@ class JobQueue extends EventEmitter {
       scene.voice_audio_url = ttsRes.audioUrl;
       scene.voice_audio_duration = ttsRes.duration;
       scene.word_timestamps = ttsRes.wordTimestamps;
+    });
+    const ttsTask = Promise.all(ttsPromises);
+
+    // Wait for all parallel asset generation tasks
+    await Promise.all([titleTask, musicTask, visualTask, ttsTask]);
+
+    project.visualSourcing = visualSourcingList;
+    if (project.aiResearch) {
+      project.aiResearch.selectedVisualCount = visualSourcingList.length;
     }
+
+    console.log(`[PERFORMANCE] [Parallel Asset Pipeline (Visuals + TTS + BGM + Titles)] Completed in ${Date.now() - parallelAssetStart}ms`);
 
     // MASTER TIMELINE SYNCHRONIZATION (Single Source of Truth)
     // Synchronize scene durations, start/end timestamps, and ensure minimum duration (>= 30s)
@@ -370,6 +401,7 @@ class JobQueue extends EventEmitter {
     db.setProject(project);
 
     // Stage 7: Subtitle Generation (75% -> 80%)
+    const s7Start = Date.now();
     this.updateStage(job, 'GENERATING_SUBTITLES', 77, `Building synchronized ${project.subtitlePreset} subtitles`);
     const srt = subtitleEngine.generateSrt(project.scenes);
     const vtt = subtitleEngine.generateVtt(project.scenes);
@@ -385,30 +417,18 @@ class JobQueue extends EventEmitter {
     project.captionsSrtUrl = `/generated/captions/captions_${project.id}.srt`;
     project.captionsVttUrl = `/generated/captions/captions_${project.id}.vtt`;
     db.setProject(project);
-
-    // Stage 8: Background Music & Audio Mixing Setup (80% -> 83%)
-    if (!project.musicCategory || project.musicCategory === 'None' || project.musicCategory === 'Cinematic' || project.musicCategory === 'General') {
-      project.musicCategory = musicProvider.detectMusicCategoryFromTopic(currentTopic.text);
-    }
-    this.updateStage(job, 'MIXING_AUDIO', 81, `Configuring ${project.musicCategory} background music track for "${currentTopic.text}"`);
-    const musicInfo = await musicProvider.ensureMusicTrackAvailable(project.musicCategory, project.id);
-    if (musicInfo) {
-      project.backgroundMusicUrl = musicInfo.url;
-    } else {
-      const musicTrack = musicProvider.getTrackForProject(project.musicCategory, project.id);
-      if (musicTrack) {
-        project.backgroundMusicUrl = musicTrack.url;
-      }
-    }
-    db.setProject(project);
+    console.log(`[PERFORMANCE] [Stage 7: Subtitles] Completed in ${Date.now() - s7Start}ms`);
 
     // Stage 9: Pre-Render Quality Control & Topic Relevance Check (83% -> 85%)
+    const s9Start = Date.now();
     this.updateStage(job, 'QUALITY_CHECK', 84, 'Executing pre-render Quality Control validation');
     const { project: validatedProject, qc } = qualityControlEngine.validateAndAutoFix(project);
     validatedProject.qcResult = qc;
     db.setProject(validatedProject);
+    console.log(`[PERFORMANCE] [Stage 9: Quality Control] Completed in ${Date.now() - s9Start}ms`);
 
     // Stage 10: FFmpeg Video Rendering (85% -> 95%)
+    const s10Start = Date.now();
     this.updateStage(job, 'RENDERING', 86, 'Rendering 1080x1920 9:16 portrait video via FFmpeg');
     const renderRes = await videoEngine.renderVideo(
       validatedProject,
@@ -416,7 +436,8 @@ class JobQueue extends EventEmitter {
         aspectRatio: validatedProject.aspectRatio,
         subtitlePreset: validatedProject.subtitlePreset,
         backgroundMusicUrl: validatedProject.backgroundMusicUrl,
-        burnSubtitles: true
+        burnSubtitles: true,
+        qualityMode: validatedProject.qualityMode || 'BALANCED'
       },
       (p, msg) => {
         this.updateStage(job, 'RENDERING', p, msg);
@@ -426,8 +447,10 @@ class JobQueue extends EventEmitter {
     validatedProject.videoUrl = renderRes.videoUrl;
     validatedProject.thumbnailUrl = renderRes.thumbnailUrl;
     db.setProject(validatedProject);
+    console.log(`[PERFORMANCE] [Stage 10: FFmpeg Video Rendering] Completed in ${Date.now() - s10Start}ms`);
 
     // Stage 11: Social Media Package & Completion (95% -> 100%)
+    const s11Start = Date.now();
     this.updateStage(job, 'QUALITY_CHECK', 96, `Verifying render integrity and building social package for "${currentTopic.text}"`);
     const socialPackage = await aiProvider.generateSocialPackage(
       currentTopic.text,
@@ -438,7 +461,7 @@ class JobQueue extends EventEmitter {
     );
     validatedProject.socialPackage = socialPackage;
 
-    const postQc = qualityControlEngine.verifyRenderedVideo(renderRes.videoUrl);
+    const postQc = await qualityControlEngine.verifyRenderedVideo(renderRes.videoUrl);
     if (!postQc.passed) {
       console.warn('Post-render QC note:', postQc.message);
     }
@@ -447,12 +470,16 @@ class JobQueue extends EventEmitter {
     validatedProject.progress = 100;
     validatedProject.currentStage = 'Video ready for download and export';
     db.setProject(validatedProject);
+    console.log(`[PERFORMANCE] [Stage 11: Social Package] Completed in ${Date.now() - s11Start}ms`);
+
+    const totalPipelineTime = Date.now() - totalPipelineStart;
+    console.log(`[PERFORMANCE] [TOTAL VIDEO GENERATION PIPELINE TIME] ${totalPipelineTime}ms (${(totalPipelineTime / 1000).toFixed(1)}s)`);
 
     job.stage = 'COMPLETED';
     job.progress = 100;
     job.status = 'COMPLETED';
     job.endTime = new Date().toISOString();
-    job.logs.push({ timestamp: new Date().toISOString(), message: `Video generation for "${currentTopic.text}" completed successfully!`, level: 'info' });
+    job.logs.push({ timestamp: new Date().toISOString(), message: `Video generation for "${currentTopic.text}" completed in ${(totalPipelineTime / 1000).toFixed(1)}s!`, level: 'info' });
     db.setJob(job);
 
     this.emit('job_updated', job);

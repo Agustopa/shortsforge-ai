@@ -23,14 +23,22 @@ export class ThumbnailEngine {
     if (!fs.existsSync(this.outputDir)) {
       fs.mkdirSync(this.outputDir, { recursive: true });
     }
+  }
 
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (apiKey) {
-      this.ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-      });
+  private ensureClient(): GoogleGenAI | null {
+    const currentKey = process.env.GEMINI_API_KEY;
+    if (!currentKey) return null;
+    if (!this.ai) {
+      try {
+        this.ai = new GoogleGenAI({
+          apiKey: currentKey,
+          httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+        });
+      } catch {
+        this.ai = null;
+      }
     }
+    return this.ai;
   }
 
   /**
@@ -83,7 +91,8 @@ export class ThumbnailEngine {
     }
 
     // If Gemini is available, enhance with AI title generation
-    if (this.ai) {
+    const client = this.ensureClient();
+    if (client) {
       try {
         const prompt = `You are a viral YouTube Shorts and TikTok content strategist.
 Given the topic: "${cleanTopic}"
@@ -102,10 +111,10 @@ Respond strictly in valid JSON format:
   "category": "..."
 }`;
 
-        const models = ['gemini-3.7-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite'];
+        const models = ['gemini-3.7-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
         for (const model of models) {
           try {
-            const response = await this.ai.models.generateContent({
+            const response = await client.models.generateContent({
               model,
               contents: prompt,
               config: {

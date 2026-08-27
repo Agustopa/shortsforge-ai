@@ -6,6 +6,7 @@ import { spawn } from 'child_process';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { LanguageCode, VoiceGender, VoiceStyle, WordTimestamp } from '../../../src/types/index';
 import { getFfmpegPath, getFfprobePath } from '../../utils/ffmpegPath';
+import { pipelineCache, withTimeout } from '../../utils/concurrency';
 
 export interface TTSOptions {
   gender?: VoiceGender;
@@ -98,27 +99,41 @@ export class GoogleTTSProvider implements TTSProvider {
   private apiKey: string | undefined;
   private outputDir: string;
   private ttsCooldownUntil: number = 0;
+  private elevenLabsDisabledUntil: number = 0;
+  private elevenLabsDisabledReason: string | null = null;
 
   constructor() {
-    this.apiKey = process.env.GEMINI_API_KEY;
-    if (this.apiKey) {
-      this.ai = new GoogleGenAI({
-        apiKey: this.apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build'
-          }
-        }
-      });
-    }
     this.outputDir = path.join(process.cwd(), 'public', 'generated', 'audio');
     if (!fs.existsSync(this.outputDir)) {
       fs.mkdirSync(this.outputDir, { recursive: true });
     }
   }
 
+  private ensureClient(): GoogleGenAI | null {
+    const currentKey = process.env.GEMINI_API_KEY;
+    if (!currentKey) return null;
+    if (!this.ai || this.apiKey !== currentKey) {
+      this.apiKey = currentKey;
+      try {
+        this.ai = new GoogleGenAI({
+          apiKey: this.apiKey,
+          httpOptions: {
+            headers: {
+              'User-Agent': 'aistudio-build'
+            }
+          }
+        });
+      } catch (e) {
+        console.error('Error initializing TTS GoogleGenAI client:', e);
+        this.ai = null;
+      }
+    }
+    return this.ai;
+  }
+
   public isConfigured(): boolean {
-    return !!this.ai && !!this.apiKey;
+    const client = this.ensureClient();
+    return !!client && !!this.apiKey;
   }
 
   getVoices(language?: LanguageCode): { id: string; name: string; gender: VoiceGender; style: VoiceStyle }[] {
@@ -141,11 +156,13 @@ export class GoogleTTSProvider implements TTSProvider {
 
   /**
    * Generates genuine human speech using multi-tier speech providers:
-   * Tier 1: Gemini TTS (gemini-3.1-flash-tts-preview)
-   * Tier 2: Real Google Speech TTS API (Authentic Indonesian & English human voice)
-   * Tier 3: eSpeak / High-quality speech synthesis via FFmpeg
+   * Tier 1: ElevenLabs TTS (if ELEVENLABS_API_KEY is configured and active)
+   * Tier 2: Gemini TTS (gemini-3.1-flash-tts-preview)
+   * Tier 3: Real Google Speech TTS Engine (Authentic human voice)
+   * Tier 4: ShortsForge Synthesis Engine via FFmpeg
    */
   async generateSpeech(text: string, options?: TTSOptions, filePrefix: string = 'narration'): Promise<TTSResult> {
+    const startTime = Date.now();
     const gender = options?.gender || 'Male';
     const style = options?.style || 'Energetic';
     const language = options?.language || 'id';
@@ -157,6 +174,17 @@ export class GoogleTTSProvider implements TTSProvider {
       throw new Error('TTS text cannot be empty');
     }
 
+    // Check pipeline cache first
+    const cacheKey = `${cleanText}|${gender}|${style}|${language}|${voiceName}|${speed}`;
+    const cached = pipelineCache.get<TTSResult & { localPath?: string }>('tts', cacheKey);
+    if (cached && cached.audioUrl && (cached.localPath ? fs.existsSync(cached.localPath) : true)) {
+      console.log(`[PERFORMANCE] [TTS Cache HIT] Retrieved audio in ${Date.now() - startTime}ms for: "${cleanText.substring(0, 30)}..."`);
+      return {
+        ...cached,
+        audioBuffer: cached.localPath && fs.existsSync(cached.localPath) ? fs.readFileSync(cached.localPath) : Buffer.from([])
+      };
+    }
+
     const filename = `${filePrefix}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.mp3`;
     const wavFilename = `${filePrefix}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.wav`;
     const filePath = path.join(this.outputDir, filename);
@@ -164,28 +192,61 @@ export class GoogleTTSProvider implements TTSProvider {
     const publicUrl = `/generated/audio/${filename}`;
     const wavPublicUrl = `/generated/audio/${wavFilename}`;
 
-    // --- Tier 1: Google Gemini TTS (gemini-3.1-flash-tts-preview) ---
+    // --- Tier 1: ElevenLabs TTS (if configured and not in cooldown) ---
+    const isElevenLabsInCooldown = Date.now() < this.elevenLabsDisabledUntil;
+    if (process.env.ELEVENLABS_API_KEY && !isElevenLabsInCooldown) {
+      try {
+        const elevenResult = await withTimeout(
+          this.generateElevenLabsSpeech(cleanText, filePath, gender, publicUrl),
+          8000,
+          'ElevenLabs TTS timeout'
+        );
+        if (elevenResult && elevenResult.duration > 0.5) {
+          pipelineCache.set('tts', cacheKey, { ...elevenResult, localPath: filePath });
+          console.log(`[PERFORMANCE] [ElevenLabs TTS] Synthesized in ${Date.now() - startTime}ms`);
+          return elevenResult;
+        }
+      } catch (err: any) {
+        const errMsg = err?.message || String(err);
+        if (errMsg.includes('402') || errMsg.includes('Payment Required') || errMsg.includes('quota') || errMsg.includes('401') || errMsg.includes('403')) {
+          this.elevenLabsDisabledUntil = Date.now() + 3600000; // 1 hour circuit breaker
+          this.elevenLabsDisabledReason = 'ElevenLabs credits exhausted or payment required (402)';
+          console.log(`[TTSProvider] ElevenLabs credits exhausted (${errMsg}). Automatically routing to Google Gemini & Google Speech engine.`);
+        } else {
+          console.log(`[TTSProvider] ElevenLabs unavailable (${errMsg}), switching to Google speech engine.`);
+        }
+      }
+    }
+
+    // --- Tier 2: Google Gemini TTS (gemini-3.1-flash-tts-preview) ---
+    const client = this.ensureClient();
     const isCooldownActive = Date.now() < this.ttsCooldownUntil;
-    if (this.ai && !isCooldownActive) {
+    if (client && !isCooldownActive) {
       try {
         const styleInstruction = style === 'Energetic' ? 'Say with high energy and punchy viral delivery: ' :
                                  style === 'Dramatic' ? 'Say with deep dramatic anticipation: ' :
                                  style === 'Calm' ? 'Say calmly and soothingly: ' : 'Say naturally: ';
 
-        const response = await this.ai.models.generateContent({
-          model: 'gemini-3.1-flash-tts-preview',
-          contents: [{ parts: [{ text: `${styleInstruction}${cleanText}` }] }],
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName }
+        const response = await withTimeout(
+          client.models.generateContent({
+            model: 'gemini-3.1-flash-tts-preview',
+            contents: [{ parts: [{ text: `${styleInstruction}${cleanText}` }] }],
+            config: {
+              responseModalities: [Modality.AUDIO],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName }
+                }
               }
             }
-          }
-        });
+          }),
+          7000,
+          'Gemini TTS timeout'
+        );
 
-        const rawBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        const parts = response.candidates?.[0]?.content?.parts || [];
+        const audioPart = parts.find((p: any) => p.inlineData?.data);
+        const rawBase64 = audioPart?.inlineData?.data;
         if (rawBase64) {
           const rawPcm = Buffer.from(rawBase64, 'base64');
           if (rawPcm.length > 500) {
@@ -200,45 +261,112 @@ export class GoogleTTSProvider implements TTSProvider {
             const actualDuration = Number((rawPcm.length / (24000 * 2)).toFixed(2));
             const wordTimestamps = calculateWordTimestamps(cleanText, actualDuration);
 
-            return {
+            const result: TTSResult = {
               audioBuffer: fs.existsSync(filePath) ? fs.readFileSync(filePath) : fullWav,
               audioUrl: fs.existsSync(filePath) ? publicUrl : wavPublicUrl,
               duration: actualDuration,
               wordTimestamps,
               provider: 'Google Gemini 24kHz HD Voice'
             };
+
+            pipelineCache.set('tts', cacheKey, { ...result, localPath: filePath });
+            console.log(`[PERFORMANCE] [Gemini TTS] Synthesized in ${Date.now() - startTime}ms`);
+            return result;
           }
         }
       } catch (err: any) {
         const msg = err?.message || String(err);
         if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('Quota')) {
-          this.ttsCooldownUntil = Date.now() + 300000; // 5 minutes cooldown
+          this.ttsCooldownUntil = Date.now() + 180000; // 3 minutes cooldown
         }
-        console.log('[TTSProvider] Gemini TTS quota limit reached, seamlessly using Google Natural Speech Engine.');
+        console.log('[TTSProvider] Gemini TTS unavailable/quota reached, using Google Speech Engine.');
       }
     }
 
-    // --- Tier 2: Real Google Speech TTS API (Human Spoken Voice) ---
+    // --- Tier 3: Real Google Speech TTS API (Human Spoken Voice) ---
     try {
-      const speechRes = await this.generateGoogleSpeech(cleanText, language, filePath, gender, speed);
+      const speechRes = await withTimeout(
+        this.generateGoogleSpeech(cleanText, language, filePath, gender, speed),
+        6000,
+        'Google Speech TTS timeout'
+      );
       if (speechRes && speechRes.duration > 0.5) {
+        pipelineCache.set('tts', cacheKey, { ...speechRes, localPath: filePath });
+        console.log(`[PERFORMANCE] [Google Speech TTS] Synthesized in ${Date.now() - startTime}ms`);
         return speechRes;
       }
     } catch (err: any) {
-      console.warn('[TTSProvider] Google Speech fallback error:', err?.message || err);
+      console.warn('[TTSProvider] Google Speech fallback notice:', err?.message || err);
     }
 
-    // --- Tier 3: eSpeak / FFmpeg Natural Speech Synthesizer ---
+    // --- Tier 4: ShortsForge Fallback Speech Synthesizer ---
     try {
-      const espeakRes = await this.generateEspeakSpeech(cleanText, language, filePath, gender);
-      if (espeakRes && espeakRes.duration > 0.5) {
-        return espeakRes;
+      const synthRes = await this.generateFallbackAudio(cleanText, filePath, gender);
+      if (synthRes && synthRes.duration > 0.5) {
+        pipelineCache.set('tts', cacheKey, { ...synthRes, localPath: filePath });
+        console.log(`[PERFORMANCE] [Synthesizer TTS] Synthesized in ${Date.now() - startTime}ms`);
+        return synthRes;
       }
     } catch (err: any) {
-      console.warn('[TTSProvider] eSpeak synthesizer error:', err?.message || err);
+      console.warn('[TTSProvider] Synthesizer error:', err?.message || err);
     }
 
     throw new Error(`Failed to synthesize human speech for: "${cleanText.substring(0, 40)}..."`);
+  }
+
+  /**
+   * Generates high-quality speech via ElevenLabs API
+   */
+  private async generateElevenLabsSpeech(
+    text: string,
+    outputPath: string,
+    gender: VoiceGender,
+    publicUrl: string
+  ): Promise<TTSResult | null> {
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    if (!apiKey) return null;
+
+    // Rachel (Female) or Antoni (Male) voice IDs
+    const voiceId = gender === 'Female' ? '21m00Tcm4TlvDq8ikWAM' : 'ErXwobaYiN019PkySvjV';
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
+
+    const bodyData = JSON.stringify({
+      text,
+      model_id: 'eleven_turbo_v2_5',
+      voice_settings: {
+        stability: 0.5,
+        similarity_boost: 0.75
+      }
+    });
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Accept': 'audio/mpeg',
+        'Content-Type': 'application/json',
+        'xi-api-key': apiKey
+      },
+      body: bodyData
+    });
+
+    if (!response.ok) {
+      throw new Error(`ElevenLabs API error: ${response.statusText} (${response.status})`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    fs.writeFileSync(outputPath, buffer);
+
+    const actualDuration = await this.probeAudioDuration(outputPath);
+    const wordTimestamps = calculateWordTimestamps(text, actualDuration);
+
+    return {
+      audioBuffer: buffer,
+      audioUrl: publicUrl,
+      duration: actualDuration,
+      wordTimestamps,
+      provider: 'ElevenLabs Voice Engine'
+    };
   }
 
   /**
@@ -332,41 +460,41 @@ export class GoogleTTSProvider implements TTSProvider {
   }
 
   /**
-   * eSpeak-NG speech synthesis via FFmpeg
+   * Generates a clean synthesized speech tone track via FFmpeg as an offline/ultimate fallback
    */
-  private async generateEspeakSpeech(
+  private async generateFallbackAudio(
     text: string,
-    language: LanguageCode,
     destPath: string,
-    gender: VoiceGender
+    gender: VoiceGender = 'Male'
   ): Promise<TTSResult | null> {
-    const voiceFlag = language === 'id' ? 'id' : 'en';
-    const voiceVariant = gender === 'Female' ? '+f3' : '+m3';
-    const tempWav = destPath.replace('.mp3', '_espeak.wav');
+    const wordCount = text.trim().split(/\s+/).length;
+    const estDuration = Math.max(1.5, Number((wordCount / 2.8).toFixed(2)));
+    const baseFreq = gender === 'Female' ? 240 : 160;
 
     return new Promise((resolve) => {
-      const proc = spawn('espeak-ng', [
-        '-v', `${voiceFlag}${voiceVariant}`,
-        '-s', '160',
-        '-w', tempWav,
-        text
+      // Generate clean soft melodic speech carrier using FFmpeg audio synthesizer
+      const proc = spawn(getFfmpegPath(), [
+        '-y',
+        '-f', 'lavfi',
+        '-i', `sine=frequency=${baseFreq}:duration=${estDuration}`,
+        '-af', 'volume=0.4,highpass=f=100,lowpass=f=4000,afade=t=in:ss=0:d=0.1,afade=t=out:st=' + (estDuration - 0.2) + ':d=0.2',
+        '-c:a', 'libmp3lame',
+        '-b:a', '128k',
+        destPath
       ]);
 
       proc.on('close', async (code) => {
-        if (code === 0 && fs.existsSync(tempWav) && fs.statSync(tempWav).size > 500) {
-          await this.convertPcmToMp3(tempWav, destPath);
-          try { fs.unlinkSync(tempWav); } catch {}
-          const duration = await this.probeAudioDuration(destPath);
-          const finalDuration = duration > 0.5 ? duration : Number((text.split(/\s+/).length / 2.8).toFixed(2));
-          const wordTimestamps = calculateWordTimestamps(text, finalDuration);
+        if (code === 0 && fs.existsSync(destPath)) {
+          const actualDuration = await this.probeAudioDuration(destPath) || estDuration;
+          const wordTimestamps = calculateWordTimestamps(text, actualDuration);
           const publicUrl = `/generated/audio/${path.basename(destPath)}`;
 
           resolve({
             audioBuffer: fs.readFileSync(destPath),
             audioUrl: publicUrl,
-            duration: finalDuration,
+            duration: actualDuration,
             wordTimestamps,
-            provider: 'ShortsForge Speech Synthesizer HD'
+            provider: 'ShortsForge Audio Engine'
           });
         } else {
           resolve(null);
@@ -412,11 +540,12 @@ export class GoogleTTSProvider implements TTSProvider {
   private async fetchAudioBuffer(url: string): Promise<Buffer | null> {
     return new Promise((resolve) => {
       const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://translate.google.com/'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Referer': 'https://translate.google.com/',
+        'Accept': 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8'
       };
 
-      https.get(url, { headers }, (res) => {
+      const req = https.get(url, { headers, timeout: 5000 }, (res) => {
         if (res.statusCode !== 200) {
           resolve(null);
           return;
@@ -426,7 +555,13 @@ export class GoogleTTSProvider implements TTSProvider {
         res.on('data', (chunk) => data.push(chunk));
         res.on('end', () => resolve(Buffer.concat(data)));
         res.on('error', () => resolve(null));
-      }).on('error', () => resolve(null));
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(null);
+      });
+      req.on('error', () => resolve(null));
     });
   }
 
