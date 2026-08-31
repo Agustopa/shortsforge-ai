@@ -150,54 +150,54 @@ export class GoogleAIProvider implements AIProvider {
       throw new Error('AI client not initialized or GEMINI_API_KEY missing');
     }
 
+    // Urutan model: yang paling stabil/tersedia dicoba duluan.
+    // gemini-3.7-flash sering kena 503 High Demand karena modelnya baru & ramai dipakai,
+    // jadi dipindah ke urutan terakhir sebagai fallback, bukan model utama.
     const modelsToTry = [
-      'gemini-3.7-flash',
+      'gemini-flash-latest',
       'gemini-3.1-flash-lite',
-      'gemini-flash-latest'
+      'gemini-3.7-flash'
     ];
 
     let lastError: any = null;
 
     for (const model of modelsToTry) {
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-          const response = await client.models.generateContent({
-            model,
-            contents: params.contents,
-            config: params.config
-          });
-          if (response) {
-            return response;
-          }
-        } catch (err: any) {
-          lastError = err;
-          const errMessage = err?.message || String(err);
-          const isHighDemand = errMessage.includes('503') ||
-                               errMessage.includes('high demand') ||
-                               errMessage.includes('overloaded') ||
-                               errMessage.includes('UNAVAILABLE') ||
-                               errMessage.includes('Service Unavailable');
-          const isQuota = err?.status === 'RESOURCE_EXHAUSTED' || 
-                          errMessage.includes('429') || 
-                          errMessage.includes('Quota exceeded') ||
-                          errMessage.includes('RESOURCE_EXHAUSTED');
-          const isNetworkOrFetch = errMessage.includes('fetch failed') ||
-                                   errMessage.includes('ENOTFOUND') ||
-                                   errMessage.includes('ECONNRESET') ||
-                                   errMessage.includes('ETIMEDOUT') ||
-                                   errMessage.includes('socket hang up') ||
-                                   errMessage.includes('timeout');
+      // 1x percobaan per model (bukan 2x) - begitu kena 503/429/network issue,
+      // langsung pindah ke model berikutnya biar total waktu tunggu jauh lebih singkat.
+      try {
+        const response = await client.models.generateContent({
+          model,
+          contents: params.contents,
+          config: params.config
+        });
+        if (response) {
+          return response;
+        }
+      } catch (err: any) {
+        lastError = err;
+        const errMessage = err?.message || String(err);
+        const isHighDemand = errMessage.includes('503') ||
+                             errMessage.includes('high demand') ||
+                             errMessage.includes('overloaded') ||
+                             errMessage.includes('UNAVAILABLE') ||
+                             errMessage.includes('Service Unavailable');
+        const isQuota = err?.status === 'RESOURCE_EXHAUSTED' || 
+                        errMessage.includes('429') || 
+                        errMessage.includes('Quota exceeded') ||
+                        errMessage.includes('RESOURCE_EXHAUSTED');
+        const isNetworkOrFetch = errMessage.includes('fetch failed') ||
+                                 errMessage.includes('ENOTFOUND') ||
+                                 errMessage.includes('ECONNRESET') ||
+                                 errMessage.includes('ETIMEDOUT') ||
+                                 errMessage.includes('socket hang up') ||
+                                 errMessage.includes('timeout');
 
-          if (isHighDemand || isQuota || isNetworkOrFetch) {
-            console.warn(`[AIProvider] ${model} attempt ${attempt} encountered transient issue (${isHighDemand ? '503 High Demand' : isQuota ? '429 Rate Limit' : 'Network Fetch'}). Retrying...`);
-            if (attempt < 2) {
-              await new Promise(r => setTimeout(r, 700 * attempt));
-              continue;
-            }
-          } else {
-            console.warn(`[AIProvider] Request failed on ${model} (attempt ${attempt}): ${errMessage.substring(0, 120)}`);
-            break;
-          }
+        if (isHighDemand || isQuota || isNetworkOrFetch) {
+          console.warn(`[AIProvider] ${model} encountered transient issue (${isHighDemand ? '503 High Demand' : isQuota ? '429 Rate Limit' : 'Network Fetch'}). Falling back to next model...`);
+          continue;
+        } else {
+          console.warn(`[AIProvider] Request failed on ${model}: ${errMessage.substring(0, 120)}`);
+          continue;
         }
       }
     }
