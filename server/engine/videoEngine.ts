@@ -405,7 +405,9 @@ export class VideoEngine {
 
     onProgress?.(86, 'Converting scene visuals to timeline segments with motion');
 
-    // Step 2: Render each scene into a segment MP4 file in parallel with controlled concurrency
+    // Step 2: Render each scene into a segment MP4 file, satu per satu (bukan paralel)
+    // supaya pemakaian RAM tetap rendah - penting untuk hosting tier Free yang RAM-nya kecil.
+    // Beberapa proses FFmpeg berjalan bersamaan gampang bikin container di-OOM-kill & restart.
     const qMode = options.qualityMode || project.qualityMode || 'BALANCED';
     const preset = qMode === 'FAST' ? 'ultrafast' : qMode === 'HIGH' ? 'medium' : 'fast';
     const crf = qMode === 'FAST' ? '24' : qMode === 'HIGH' ? '18' : '20';
@@ -415,7 +417,7 @@ export class VideoEngine {
 
     const renderedSegmentFiles = await runWithConcurrency(
       project.scenes,
-      3, // Concurrency limit 3 for balanced CPU utilization
+      1, // Concurrency diturunkan dari 3 -> 1 supaya hemat RAM di tier Free (lebih lambat, tapi stabil)
       async (scene, i) => {
         const segFile = path.join(projectTempDir, `seg_${i}.mp4`);
         const dur = Math.max(1.5, scene.duration);
