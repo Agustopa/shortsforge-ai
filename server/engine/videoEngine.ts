@@ -46,9 +46,12 @@ export class VideoEngine {
   }
 
   private getDimensions(aspectRatio: AspectRatio): { width: number; height: number } {
-    if (aspectRatio === '16:9') return { width: 1920, height: 1080 };
-    if (aspectRatio === '1:1') return { width: 1080, height: 1080 };
-    return { width: 1080, height: 1920 }; // Default 9:16 portrait
+    // Resolusi diturunkan dari Full HD (1080/1920) ke HD (720/1280) untuk menekan
+    // pemakaian RAM saat render di hosting dengan RAM terbatas (tier Free).
+    // Tetap terlihat tajam untuk kebutuhan TikTok/Reels/Shorts yang ditonton di HP.
+    if (aspectRatio === '16:9') return { width: 1280, height: 720 };
+    if (aspectRatio === '1:1') return { width: 720, height: 720 };
+    return { width: 720, height: 1280 }; // Default 9:16 portrait
   }
 
   public runCommand(cmd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
@@ -109,7 +112,7 @@ export class VideoEngine {
         spawnSync(getFfmpegPath(), [
           '-y',
           '-f', 'lavfi',
-          '-i', `color=c=${color}:s=1080x1920:d=1`,
+          '-i', `color=c=${color}:s=720x1280:d=1`,
           '-frames:v', '1',
           '-update', '1',
           fallbackPath
@@ -163,7 +166,7 @@ export class VideoEngine {
           await this.runCommand('ffmpeg', [
             '-y',
             '-f', 'lavfi',
-            '-i', `color=c=${color}:s=1080x1920:d=1`,
+            '-i', `color=c=${color}:s=720x1280:d=1`,
             '-frames:v', '1',
             '-update', '1',
             recoveryPath
@@ -437,7 +440,7 @@ export class VideoEngine {
             '-crf', crf,
             '-profile:v', 'high',
             '-level', '4.0',
-            '-threads', '0',
+            '-threads', '1',
             '-pix_fmt', 'yuv420p',
             '-r', '30',
             '-an',
@@ -468,7 +471,7 @@ export class VideoEngine {
             '-crf', crf,
             '-profile:v', 'high',
             '-level', '4.0',
-            '-threads', '0',
+            '-threads', '1',
             '-pix_fmt', 'yuv420p',
             '-r', '30',
             segFile
@@ -682,7 +685,7 @@ export class VideoEngine {
         '-crf', crf,
         '-profile:v', 'high',
         '-level', '4.0',
-        '-threads', '0',
+        '-threads', '1',
         '-pix_fmt', 'yuv420p',
         '-color_primaries', '1',
         '-color_trc', '1',
