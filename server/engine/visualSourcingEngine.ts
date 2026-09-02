@@ -409,19 +409,14 @@ export class VisualSourcingEngine {
     if (categoryKey !== 'general' && STOCK_LIBRARY[categoryKey]) {
       pool = STOCK_LIBRARY[categoryKey];
     } else {
-      // General search across non-conflicting pools
-      const isSpace = query.includes('moon') || query.includes('bulan') || query.includes('space');
-      const isCat = query.includes('cat') || query.includes('kucing');
-      const isWater = query.includes('water') || query.includes('air');
-
-      pool = Object.entries(STOCK_LIBRARY)
-        .filter(([k]) => {
-          if (!isSpace && k === 'space_lunar') return false;
-          if (!isCat && k === 'cats_felines') return false;
-          if (!isWater && k === 'water_hydration') return false;
-          return true;
-        })
-        .flatMap(([, items]) => items);
+      // Topik tidak cocok dengan kategori manapun di STOCK_LIBRARY (perpustakaan gambar-nya
+      // cuma 6 kategori terbatas: air, kucing, sejarah, laut, olahraga, luar angkasa).
+      // Sebelumnya di sini kode mencampur SEMUA kategori lain jadi satu kolam acak,
+      // sehingga topik yang tidak nyambung (mis. "resep ayam goreng") bisa dapat foto
+      // orang olahraga/piramida/dll yang sama sekali tidak relevan.
+      // Sekarang: kosongkan pool, biar sistem lanjut ke fallback berikutnya
+      // (generateThematicSynthesizedVisual) yang memang dibuat sesuai topik asli.
+      pool = [];
     }
 
     // Filter out already used in this job if unused alternatives exist
