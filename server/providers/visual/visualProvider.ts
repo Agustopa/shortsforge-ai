@@ -882,6 +882,17 @@ export class UnifiedVisualProvider {
       const dir = path.dirname(destPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
+      // Ambil beberapa kata pertama dari topik/konteks scene sebagai teks tampilan,
+      // supaya fallback paling akhir ini nggak jadi layar kosong tanpa keterangan sama sekali.
+      const rawText = (topicContext || 'ShortsForge AI').trim();
+      const safeText = rawText
+        .replace(/['":\\]/g, '')
+        .split(/\s+/)
+        .slice(0, 6)
+        .join(' ')
+        .toUpperCase()
+        .slice(0, 60) || 'SHORTSFORGE AI';
+
       await new Promise<void>((resolve) => {
         const proc = spawn(getFfmpegPath(), [
           '-y',
@@ -889,11 +900,28 @@ export class UnifiedVisualProvider {
           '-i', `color=c=${color}:s=1080x1920:d=1`,
           '-frames:v', '1',
           '-update', '1',
+          '-vf', `drawtext=text='${safeText}':fontsize=64:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=20:shadowcolor=black:shadowx=3:shadowy=3`,
           destPath
         ]);
         proc.on('close', () => resolve());
         proc.on('error', () => resolve());
       });
+
+      // Kalau drawtext gagal (mis. fontconfig tidak tersedia), pastikan tetap ada file warna polos
+      if (!fs.existsSync(destPath) || fs.statSync(destPath).size < 500) {
+        await new Promise<void>((resolve) => {
+          const proc2 = spawn(getFfmpegPath(), [
+            '-y',
+            '-f', 'lavfi',
+            '-i', `color=c=${color}:s=1080x1920:d=1`,
+            '-frames:v', '1',
+            '-update', '1',
+            destPath
+          ]);
+          proc2.on('close', () => resolve());
+          proc2.on('error', () => resolve());
+        });
+      }
     } catch {
       // fallback to basic buffer if ffmpeg fails
       try {
