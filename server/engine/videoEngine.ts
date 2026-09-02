@@ -108,6 +108,14 @@ export class VideoEngine {
     if (!fs.existsSync(fallbackPath)) {
       const colors = ['#0f172a', '#1e1b4b', '#172554', '#042f2e', '#2e1065', '#18181b'];
       const color = colors[sceneIndex % colors.length];
+      const rawText = (scene.narration || scene.visual_prompt || scene.search_query || 'ShortsForge AI').trim();
+      const safeText = rawText
+        .replace(/['":\\]/g, '')
+        .split(/\s+/)
+        .slice(0, 6)
+        .join(' ')
+        .toUpperCase()
+        .slice(0, 60) || 'SHORTSFORGE AI';
       try {
         spawnSync(getFfmpegPath(), [
           '-y',
@@ -115,9 +123,23 @@ export class VideoEngine {
           '-i', `color=c=${color}:s=720x1280:d=1`,
           '-frames:v', '1',
           '-update', '1',
+          '-vf', `drawtext=text='${safeText}':fontsize=48:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=16:shadowcolor=black:shadowx=3:shadowy=3`,
           fallbackPath
         ]);
       } catch {}
+      // Kalau drawtext gagal, pastikan tetap ada file warna polos
+      if (!fs.existsSync(fallbackPath)) {
+        try {
+          spawnSync(getFfmpegPath(), [
+            '-y',
+            '-f', 'lavfi',
+            '-i', `color=c=${color}:s=720x1280:d=1`,
+            '-frames:v', '1',
+            '-update', '1',
+            fallbackPath
+          ]);
+        } catch {}
+      }
     }
 
     scene.visualAsset = fallbackPath;
@@ -163,12 +185,21 @@ export class VideoEngine {
           if (!fs.existsSync(visualsDir)) fs.mkdirSync(visualsDir, { recursive: true });
 
           const color = colors[index % colors.length];
+          const rawText = (scene.narration || scene.visual_prompt || scene.search_query || 'ShortsForge AI').trim();
+          const safeText = rawText
+            .replace(/['":\\]/g, '')
+            .split(/\s+/)
+            .slice(0, 6)
+            .join(' ')
+            .toUpperCase()
+            .slice(0, 60) || 'SHORTSFORGE AI';
           await this.runCommand('ffmpeg', [
             '-y',
             '-f', 'lavfi',
             '-i', `color=c=${color}:s=720x1280:d=1`,
             '-frames:v', '1',
             '-update', '1',
+            '-vf', `drawtext=text='${safeText}':fontsize=48:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=16:shadowcolor=black:shadowx=3:shadowy=3`,
             recoveryPath
           ]);
           scene.visualAsset = recoveryPath;
